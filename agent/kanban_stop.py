@@ -32,7 +32,16 @@ def kanban_stop_nudge_enabled() -> bool:
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    if not task:
+        return False
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        # Keep the legacy env-only fallback if the optional delegation context
+        # cannot import during early bootstrap.
+        return True
 
 
 def _tool_call_name(tc: Any) -> str:
