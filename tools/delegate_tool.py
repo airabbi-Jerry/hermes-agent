@@ -1182,6 +1182,18 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 # cap for users who want one.
 _HEARTBEAT_STALE_CYCLES_IDLE = 15  # 15 * 30s = 450s idle between turns → stale
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → stale
+# How long a DETACHED (background) batch keeps waiting on its children after
+# the async registry cancels it — stale monitor, /stop, or session end. The
+# children have already been signalled; a responsive one unwinds in seconds and
+# hands back its real partial work, which is always better than the fabricated
+# entry we would put in its place, so the window is generous. Past it we stop
+# waiting on the unresponsive remainder: the children that DID finish must
+# still reach the parent, and a batch that never returns is force-finalized by
+# the registry with an EMPTY results list, losing them.
+# Must stay comfortably under async_delegation._STALL_GRACE_SECONDS (120s, and
+# only enforced on the next 30s monitor sweep) so the runner's own return
+# always wins the race against that force-finalization.
+_DETACHED_CANCEL_UNWIND_SECONDS = 60.0
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
 
@@ -4006,6 +4018,10 @@ def delegate_task(
 
     overall_start = time.monotonic()
     results = []
+    # Set by _batch_interrupt when the async registry cancels a DETACHED batch
+    # (stale monitor, /stop, session end). Never set on the synchronous path,
+    # which is cancelled through parent_agent._interrupt_requested instead.
+    detached_cancelled = threading.Event()
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
@@ -4143,11 +4159,16 @@ def delegate_task(
             completed_count = 0
             spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
-            # Daemon workers (tools.daemon_pool): the `with` block still joins
-            # normally, but if the parent is interrupted while a child is
-            # wedged, the abandoned worker must not block interpreter exit.
+            # Daemon workers (tools.daemon_pool): abandoned workers must not
+            # block interpreter exit when a child is wedged. We drive
+            # shutdown() ourselves instead of using the `with` form, because
+            # its unconditional shutdown(wait=True) would re-join exactly the
+            # wedged worker we just gave up on and never publish the results
+            # its siblings already produced.
             from tools.daemon_pool import DaemonThreadPoolExecutor
-            with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
+            executor = DaemonThreadPoolExecutor(max_workers=max_children)
+            abandoned_children = False
+            try:
                 futures = {}
                 for i, t, child in children:
                     child_context = contextvars.copy_context()
@@ -4173,7 +4194,48 @@ def delegate_task(
                 # still-pending futures can carry the correct _delegate_role.
                 _child_by_index = {i: child for (i, _, child) in children}
 
+                def _abandon_pending(still_pending, reason: str) -> None:
+                    """Bank every finished child, fabricate an entry per straggler.
+
+                    Whatever already completed is a real result the parent must
+                    still receive; the rest are reported as unfinished rather
+                    than dropped silently.
+                    """
+                    nonlocal completed_count
+                    for f in still_pending:
+                        idx = futures[f]
+                        if f.done():
+                            try:
+                                entry = f.result()
+                            except Exception as exc:
+                                entry = {
+                                    "task_index": idx,
+                                    "status": "error",
+                                    "summary": None,
+                                    "error": str(exc),
+                                    "api_calls": 0,
+                                    "duration_seconds": 0,
+                                    "_child_role": getattr(
+                                        _child_by_index.get(idx), "_delegate_role", None
+                                    ),
+                                }
+                        else:
+                            entry = {
+                                "task_index": idx,
+                                "status": "interrupted",
+                                "summary": None,
+                                "error": reason,
+                                "api_calls": 0,
+                                "duration_seconds": 0,
+                                "_child_role": getattr(
+                                    _child_by_index.get(idx), "_delegate_role", None
+                                ),
+                            }
+                        results.append(entry)
+                        completed_count += 1
+
                 pending = set(futures.keys())
+                cancel_deadline = None
                 while pending:
                     if (
                         honor_parent_interrupt
@@ -4182,38 +4244,41 @@ def delegate_task(
                         # Parent interrupted — collect whatever finished and
                         # abandon the rest.  Children already received the
                         # interrupt signal; we just can't wait forever.
-                        for f in pending:
-                            idx = futures[f]
-                            if f.done():
-                                try:
-                                    entry = f.result()
-                                except Exception as exc:
-                                    entry = {
-                                        "task_index": idx,
-                                        "status": "error",
-                                        "summary": None,
-                                        "error": str(exc),
-                                        "api_calls": 0,
-                                        "duration_seconds": 0,
-                                        "_child_role": getattr(
-                                            _child_by_index.get(idx), "_delegate_role", None
-                                        ),
-                                    }
-                            else:
-                                entry = {
-                                    "task_index": idx,
-                                    "status": "interrupted",
-                                    "summary": None,
-                                    "error": "Parent agent interrupted — child did not finish in time",
-                                    "api_calls": 0,
-                                    "duration_seconds": 0,
-                                    "_child_role": getattr(
-                                        _child_by_index.get(idx), "_delegate_role", None
-                                    ),
-                                }
-                            results.append(entry)
-                            completed_count += 1
+                        _abandon_pending(
+                            pending,
+                            "Parent agent interrupted — child did not finish in time",
+                        )
+                        abandoned_children = True
                         break
+
+                    if detached_cancelled.is_set():
+                        # The async registry cancelled this detached batch. The
+                        # children were signalled by _batch_interrupt; give the
+                        # responsive ones a bounded window to unwind and hand
+                        # back their real partial work, then stop waiting on the
+                        # remainder. Waiting forever on one wedged child is what
+                        # let the registry's stall grace expire and force-finalize
+                        # the batch with an EMPTY results list, discarding the
+                        # siblings that had already finished.
+                        if cancel_deadline is None:
+                            cancel_deadline = (
+                                time.monotonic() + _DETACHED_CANCEL_UNWIND_SECONDS
+                            )
+                        elif time.monotonic() >= cancel_deadline:
+                            logger.warning(
+                                "Background delegation cancelled: %d of %d "
+                                "child(ren) did not unwind within %.0fs — "
+                                "returning the completed results without them.",
+                                len(pending), n_tasks,
+                                _DETACHED_CANCEL_UNWIND_SECONDS,
+                            )
+                            _abandon_pending(
+                                pending,
+                                "Background delegation cancelled — child did "
+                                "not unwind in time",
+                            )
+                            abandoned_children = True
+                            break
 
                     from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
 
@@ -4274,6 +4339,12 @@ def delegate_task(
                                 )
                             except Exception as e:
                                 logger.debug("Spinner update_text failed: %s", e)
+            finally:
+                # Joining here would block on exactly the child we just gave
+                # up on. The pool's workers are daemon threads, so leaving
+                # them running holds nothing open; their late return values
+                # are discarded (their entries are already banked above).
+                executor.shutdown(wait=not abandoned_children)
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
@@ -4444,6 +4515,11 @@ def delegate_task(
                         _c._interrupt_requested = True
                 except Exception:
                     pass
+            # Also cancel the JOIN. Signalling the children is not enough: one
+            # that ignores the signal would keep the aggregator waiting past
+            # the registry's stall grace, which then force-finalizes the batch
+            # with an empty results list and loses the children that finished.
+            detached_cancelled.set()
 
         def _batch_progress():
             # Progress token for the async registry's stale monitor: the

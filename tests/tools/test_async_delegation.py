@@ -741,6 +741,105 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     assert evt["origin_ui_session_id"] == "origin-tab"
 
 
+def test_stalled_background_batch_keeps_children_that_already_finished(monkeypatch):
+    """One wedged child must not take its finished siblings down with it.
+
+    The stale monitor interrupts a detached batch that stopped making
+    progress and gives it a grace window to unwind and deliver its partial
+    results through the NORMAL finalize path. The batch aggregator joined on
+    every child unconditionally, so a child that ignores the interrupt kept
+    the runner from ever returning: the grace expired and _finalize_stalled
+    published `results: []`, discarding the sibling that had already
+    completed — its summary never reached the parent, in this process or any
+    other.
+    """
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    _fast_stale_monitor(monkeypatch, idle=0.15, in_tool=0.3, grace=6.0)
+    # Keep the post-interrupt unwind window well inside that grace window.
+    # raising=False so this test also exercises (and fails on) source where
+    # the batch runner has no cancellation input at all.
+    monkeypatch.setattr(dt, "_DETACHED_CANCEL_UNWIND_SECONDS", 0.2, raising=False)
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+
+    wedged = threading.Event()
+
+    def _new_child(**kwargs):
+        child = MagicMock()
+        child._delegate_role = "leaf"
+        # Frozen progress token, no current tool → trips the idle threshold.
+        child.get_activity_summary.return_value = {
+            "api_call_count": 1,
+            "current_tool": None,
+            "last_activity_ts": 1000.0,
+        }
+        return child
+
+    def fake_run_single_child(task_index, goal, child=None, parent_agent=None, **kw):
+        if task_index == 0:
+            return {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "finished before the sibling wedged",
+                "api_calls": 2,
+                "duration_seconds": 0.1,
+                "model": "m",
+                "exit_reason": "completed",
+            }
+        # Wedged inside its first API call — ignores the interrupt entirely.
+        wedged.wait(timeout=30)
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "far too late",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+        }
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", _new_child)
+    monkeypatch.setattr(dt, "_run_single_child", fake_run_single_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+
+    out = dt.delegate_task(
+        tasks=[
+            {"goal": "summarize the release notes"},
+            {"goal": "audit the deployment scripts"},
+        ],
+        background=True,
+        parent_agent=parent,
+    )
+    dispatched = json.loads(out)
+    assert dispatched["status"] == "dispatched"
+
+    try:
+        evt = _drain_for(dispatched["delegation_id"], timeout=15.0)
+        assert evt is not None
+        # The runner returned inside the grace window, so the NORMAL batch
+        # finalize path published the event — not the synthetic stalled one.
+        assert evt["status"] == "completed"
+        results = {r["task_index"]: r for r in (evt.get("results") or [])}
+        # The finished sibling's real result survives the stall.
+        assert results[0]["status"] == "completed"
+        assert results[0]["summary"] == "finished before the sibling wedged"
+        # The wedged child is reported as abandoned, never silently dropped.
+        assert results[1]["status"] == "interrupted"
+        assert results[1]["error"]
+    finally:
+        wedged.set()
+
+
 def test_concurrent_dispatch_respects_capacity():
     """Two threads racing dispatch with cap=1 must yield exactly one accept
     (capacity check and record insert are atomic under the records lock)."""
