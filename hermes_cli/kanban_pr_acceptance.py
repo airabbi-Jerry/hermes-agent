@@ -12,6 +12,10 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+# GitHub's answer to rules reads when the plan cannot enforce rules at all (private repositories on Free).
+_PLAN_GATED = ("403", "Upgrade to GitHub Pro or make this repository public to enable this feature.")
+# Such repositories get the CI gate job that hermes-agent's protect-main ruleset requires, pinned to Actions.
+_CI_GATE = ("All required checks pass", 15368)
 
 
 def validate_contract(value: str | None) -> str:
@@ -34,6 +38,19 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
     if isinstance(value, dict) and value.get("errors"):
         raise ValueError("GitHub returned incomplete GraphQL evidence")
     return value
+
+
+def _rules(repo: str, branch: str) -> list | None:
+    """Ruleset pages, or None when GitHub's plan cannot enforce rules on this repository."""
+    try:
+        return _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+    except subprocess.CalledProcessError as error:
+        # gh prints the error body on stdout. Auth, SSO, rate-limit and not-found refusals stay infra.
+        body = json.loads(error.stdout or "null")
+        page = body[0] if isinstance(body, list) and len(body) == 1 and isinstance(body[0], dict) else {}
+        if (page.get("status"), page.get("message")) != _PLAN_GATED:
+            raise
+        return None
 
 
 def collect_acceptance(contract: str, published_pr: str | None) -> dict:
@@ -61,8 +78,11 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
-        for page in rules:
+        rules = _rules(repo, branch)
+        if rules is None and not protection:
+            required.add(_CI_GATE)
+            receipt["detail"] = f"GitHub's plan cannot require checks on {repo}; the GitHub Actions gate '{_CI_GATE[0]}' is required instead."
+        for page in rules or []:
             for rule in page:
                 if rule["type"] == "required_status_checks":
                     required.update((r["context"], r.get("integration_id"))
