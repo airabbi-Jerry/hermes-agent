@@ -1,4 +1,4 @@
-"""Two lifecycle invariants, using real SQLite and a local GitHub HTTP contract."""
+"""PR acceptance invariants, using real SQLite and a local GitHub HTTP contract."""
 import json
 import os
 import sys
@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
+from hermes_cli.kanban_pr_acceptance import collect_acceptance
 
 
 @pytest.fixture
@@ -22,13 +23,19 @@ def github(tmp_path, monkeypatch):
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+                    "baseRef": {"branchProtectionRule": None if state.get("unprotected") else {"requiredStatusChecks": [
                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+            elif "/rules/branches/" in self.path and state.get("rules_error"):
+                status, body = state["rules_error"]
+                self.send_response(status)
+                self.end_headers()
+                self.wfile.write((body if isinstance(body, str) else json.dumps(body)).encode())
+                return
             elif "/rules/branches/" in self.path:
                 value = [[]]
             elif "/check-runs" in self.path:
-                run = {"id": 42, "name": "required", "head_sha": sha,
-                       "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
+                run = {"id": 42, "name": state.get("name", "required"), "head_sha": sha,
+                       "app": {"id": state.get("app", 1)}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
                        "html_url": "https://github.com/acme/repo/actions/runs/42"}
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
@@ -60,9 +67,11 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    # Like gh, an HTTP error prints the response body to stdout and exits non-zero.
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.error,urllib.request\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try: print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e: print(e.read().decode()); sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -129,3 +138,31 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             assert kb.get_task(conn, tid).status != "done"
             assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0] == 0
             github.pop("race")
+
+
+def test_plan_gated_rules_require_the_actions_gate_while_other_refusals_stay_infra(github):
+    # Private repositories on GitHub Free cannot require checks; for their rules read,
+    # gh --paginate --slurp prints exactly this body and exits 1.
+    refusal = {"message": "Upgrade to GitHub Pro or make this repository public to enable this feature.",
+               "documentation_url": "https://docs.github.com/rest/repos/rules#get-rules-for-a-branch", "status": "403"}
+    gated = {"unprotected": True, "rules_error": (403, [refusal]), "name": "All required checks pass", "app": 15368}
+    url = "https://github.com/acme/repo/pull/7"
+    github.update(gated)
+    receipt = collect_acceptance(url, url)
+    assert (receipt["ok"], receipt["classification"], receipt["head_sha"]) == (True, "success", "a" * 40)
+    assert receipt["required"] == [{"context": "All required checks pass", "app_id": 15368}]
+    assert [(c["id"], c["head_sha"], c["classification"]) for c in receipt["checks"]] == [(42, "a" * 40, "success")]
+    for fault, expected in (({"missing": True}, "missing"), ({"app": 1}, "missing"),
+                            ({"conclusion": "failure"}, "failure"), ({"conclusion": "pending"}, "pending"),
+                            ({"stale": True}, "stale"),
+                            # Readable classic protection is never replaced by the gate.
+                            ({"unprotected": False}, "missing"),
+                            # Only the plan refusal is policy; auth, not-found and malformed bodies are not.
+                            ({"rules_error": (403, [{**refusal, "message": "Resource not accessible by integration"}])}, "infra"),
+                            ({"rules_error": (404, [{**refusal, "message": "Not Found", "status": "404"}])}, "infra"),
+                            ({"rules_error": (403, "<html>unavailable</html>")}, "infra")):
+        for key in ("missing", "stale"):
+            github.pop(key, None)
+        github.update({**gated, "conclusion": "success", **fault})
+        receipt = collect_acceptance(url, url)
+        assert (receipt["ok"], receipt["classification"]) == (False, expected), fault

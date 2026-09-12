@@ -63,8 +63,11 @@ re-reads the PR head/base. Optional failed/skipped telemetry does not veto accep
 required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped or
 neutral **required** evidence cannot complete the card. Neither can zero-run
 acceptance, unreadable policy or GitHub API failures. A repository without required
-checks needs a local-only contract. `gh` must be authenticated with read access to
-the repository's checks and rules; no remote writes are performed by this gate.
+checks needs a local-only contract, except a private repository whose GitHub plan
+refuses rules reads (GitHub Free): when it has no classic protection either, the
+GitHub Actions check `All required checks pass` is required at the exact head.
+`gh` must be authenticated with read access to the repository's checks and rules;
+no remote writes are performed by this gate.
 
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
 store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery
