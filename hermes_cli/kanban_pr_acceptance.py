@@ -16,6 +16,8 @@ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 _PLAN_GATED = ("403", "Upgrade to GitHub Pro or make this repository public to enable this feature.")
 # Such repositories get the CI gate job that hermes-agent's protect-main ruleset requires, pinned to Actions.
 _CI_GATE = ("All required checks pass", 15368)
+# Completed conclusions that report a check did not run; they cannot veto a plan-gated head.
+_NOT_RUN = ("skipped", "neutral")
 
 
 def validate_contract(value: str | None) -> str:
@@ -79,9 +81,11 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
         rules = _rules(repo, branch)
-        if rules is None and not protection:
+        plan_gated = rules is None and not protection
+        if plan_gated:
             required.add(_CI_GATE)
-            receipt["detail"] = f"GitHub's plan cannot require checks on {repo}; the GitHub Actions gate '{_CI_GATE[0]}' is required instead."
+            receipt["detail"] = (f"GitHub's plan cannot require checks on {repo}; the GitHub Actions gate "
+                                 f"'{_CI_GATE[0]}' and every other check that ran at the head are required instead.")
         for page in rules or []:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -97,6 +101,17 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
             raise ValueError("Incomplete check-run pagination")
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True) for s in page]
         outcomes = []
+
+        def record(context: str, check: dict) -> None:
+            is_run = "conclusion" in check
+            outcome = check.get("conclusion") if is_run else check["state"]
+            classification = _classify(check, sha, outcome, is_run)
+            outcomes.append(classification)
+            receipt["checks"].append({"name": context, "id": check["id"],
+                "url": check.get("html_url") or check.get("target_url"),
+                "head_sha": check.get("head_sha", check.get("sha")),
+                "classification": classification, "conclusion": outcome})
+
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
@@ -107,14 +122,17 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                 outcomes.append("missing")
                 receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
             for check in selected:
-                is_run = "conclusion" in check
-                outcome = check.get("conclusion") if is_run else check["state"]
-                classification = _classify(check, sha, outcome, is_run)
-                outcomes.append(classification)
-                receipt["checks"].append({"name": context, "id": check["id"],
-                    "url": check.get("html_url") or check.get("target_url"),
-                    "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
+                record(context, check)
+        if plan_gated:
+            # The gate job need not cover every workflow (Atlas's deterministic-gates is separate),
+            # and nothing else is enforceable, so any other check that ran at this head must pass too.
+            for run in runs:
+                if (run["name"], run["app"]["id"]) != _CI_GATE and not (
+                        run.get("status") == "completed" and run.get("conclusion") in _NOT_RUN):
+                    record(run["name"], run)
+            latest = {s["context"]: s for s in sorted(statuses, key=lambda s: s["id"])}
+            for context, status in sorted(latest.items()):
+                record(context, status)
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}")
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):

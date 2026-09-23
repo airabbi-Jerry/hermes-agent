@@ -65,7 +65,9 @@ neutral **required** evidence cannot complete the card. Neither can zero-run
 acceptance, unreadable policy or GitHub API failures. A repository without required
 checks needs a local-only contract, except a private repository whose GitHub plan
 refuses rules reads (GitHub Free): when it has no classic protection either, the
-GitHub Actions check `All required checks pass` is required at the exact head.
+GitHub Actions check `All required checks pass` is required at the exact head, and
+so is every other check run or status that ran there (only skipped or neutral runs
+are ignored), because nothing else on such a repository is enforceable.
 `gh` must be authenticated with read access to the repository's checks and rules;
 no remote writes are performed by this gate.
 
