@@ -40,6 +40,9 @@ def github(tmp_path, monkeypatch):
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
                 runs = [] if state.get("missing") else [run]
+                if state.get("sibling"):
+                    runs.append({**run, "id": 43, "name": "deterministic-gates", "conclusion": state["sibling"],
+                                 "status": "in_progress" if state["sibling"] == "pending" else "completed"})
                 value = [{"total_count": 100 + len(runs), "check_runs": [
                     {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
                     for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
@@ -48,7 +51,8 @@ def github(tmp_path, monkeypatch):
                 if state.get("head_change"):
                     state["head"] = "b" * 40
             elif "/statuses" in self.path:
-                value = [[]]
+                value = [[{"id": i, "context": "legacy", "state": st, "sha": sha}
+                          for i, st in enumerate(("failure", state["status"]))]] if state.get("status") else [[]]
             elif "/pulls/" in self.path:
                 value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
             else:
@@ -155,13 +159,16 @@ def test_plan_gated_rules_require_the_actions_gate_while_other_refusals_stay_inf
     for fault, expected in (({"missing": True}, "missing"), ({"app": 1}, "missing"),
                             ({"conclusion": "failure"}, "failure"), ({"conclusion": "pending"}, "pending"),
                             ({"stale": True}, "stale"),
+                            # A green gate does not cover a separate workflow that failed or is still running.
+                            ({"sibling": "failure"}, "failure"), ({"sibling": "pending"}, "pending"),
+                            ({"sibling": "cancelled"}, "infra"), ({"status": "pending"}, "pending"),
                             # Readable classic protection is never replaced by the gate.
                             ({"unprotected": False}, "missing"),
                             # Only the plan refusal is policy; auth, not-found and malformed bodies are not.
                             ({"rules_error": (403, [{**refusal, "message": "Resource not accessible by integration"}])}, "infra"),
                             ({"rules_error": (404, [{**refusal, "message": "Not Found", "status": "404"}])}, "infra"),
                             ({"rules_error": (403, "<html>unavailable</html>")}, "infra")):
-        for key in ("missing", "stale"):
+        for key in ("missing", "stale", "sibling", "status"):
             github.pop(key, None)
         github.update({**gated, "conclusion": "success", **fault})
         receipt = collect_acceptance(url, url)
