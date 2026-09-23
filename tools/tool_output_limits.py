@@ -64,6 +64,8 @@ def _reset_tool_output_limits_cache() -> None:
 # single 50,000-char tool result is a large fraction of the whole allowance. A ContextVar (not a
 # module global) because cron runs jobs concurrently in the same process: the value must follow
 # one run's context and be invisible to every other job. ``None`` = use the configured limit.
+# The same value is the run's cap on ``read_file`` (``get_run_output_cap``): config ``max_bytes``
+# only governs terminal output, so a budgeted run would otherwise still take a 13K-char read.
 _max_bytes_override: ContextVar[Optional[int]] = ContextVar(
     "hermes_tool_output_max_bytes_override", default=None)
 
@@ -76,6 +78,11 @@ def set_max_bytes_override(value: Optional[int]):
 
 def reset_max_bytes_override(token) -> None:
     _max_bytes_override.reset(token)
+
+
+def get_run_output_cap() -> Optional[int]:
+    """This run's per-result char cap for every tool output, or ``None`` outside a capped run."""
+    return _max_bytes_override.get()
 
 
 def get_max_bytes() -> int:

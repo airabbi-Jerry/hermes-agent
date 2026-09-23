@@ -685,6 +685,40 @@ class TestConfigOverride(unittest.TestCase):
         self.assertIn("content", result)
 
 
+class TestRunOutputCap(unittest.TestCase):
+    """A budgeted run's tool-output cap bounds read_file too, without hiding the rest of the file."""
+
+    def setUp(self):
+        _read_tracker.clear()
+        self.tmpdir = _make_safe_tempdir("run_cap_")
+        self.path = os.path.join(self.tmpdir, "big.txt")
+        with open(self.path, "w") as f:
+            f.write("".join(f"line {i:03d} " + "x" * 50 + "\n" for i in range(1, 101)))
+
+    def tearDown(self):
+        _read_tracker.clear()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_capped_read_truncates_with_continuation_and_uncapped_is_unchanged(self):
+        from tools.tool_output_limits import reset_max_bytes_override, set_max_bytes_override
+
+        token = set_max_bytes_override(1_000)
+        try:
+            first = json.loads(read_file_tool(self.path, task_id="cap1"))
+            self.assertTrue(first["truncated"])
+            self.assertLessEqual(len(first["content"]), 1_000)
+            self.assertIn(f"offset={first['next_offset']}", first["hint"])
+            rest = json.loads(read_file_tool(self.path, offset=first["next_offset"], task_id="cap1"))
+            self.assertIn(f"line {first['next_offset']:03d} ", rest["content"])
+        finally:
+            reset_max_bytes_override(token)
+
+        uncapped = json.loads(read_file_tool(self.path, task_id="cap2"))
+        self.assertNotEqual(uncapped.get("truncated_by"), "bytes")
+        self.assertIn("line 100 ", uncapped["content"])
+
+
 # ---------------------------------------------------------------------------
 # Write invalidates dedup cache (fixes #13144)
 # ---------------------------------------------------------------------------

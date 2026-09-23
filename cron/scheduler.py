@@ -2539,10 +2539,12 @@ def _apply_cron_state_budget(agent, job: dict, job_id: str) -> Optional[dict]:
     tool_chars = int(budget * _STATE_BUDGET_TOOL_OUTPUT_CHARS_RATIO)
     with contextlib.suppress(Exception):
         from tools.tool_output_limits import get_max_bytes, set_max_bytes_override
-        if tool_chars < get_max_bytes():
-            # Token returned for run_job's finally; the override must not outlive this run.
-            applied["_tool_output_token"] = set_max_bytes_override(tool_chars)
-            applied["state_tool_output_chars"] = tool_chars
+        # Set even when config max_bytes is already stricter: the run cap also bounds read_file,
+        # which config max_bytes does not govern. Never looser than the configured terminal cap.
+        tool_chars = min(tool_chars, get_max_bytes())
+        # Token returned for run_job's finally; the override must not outlive this run.
+        applied["_tool_output_token"] = set_max_bytes_override(tool_chars)
+        applied["state_tool_output_chars"] = tool_chars
 
     logger.info(
         "Job '%s': state budget %s tokens (prune >= %s, compact >= %s, max_iterations %s -> %s; "
