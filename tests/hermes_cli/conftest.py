@@ -20,6 +20,28 @@ def all_assignees_spawnable(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_launchd_daemon_plist_dir(tmp_path_factory, monkeypatch):
+    """Point ``gateway.LAUNCHD_DAEMON_PLIST_DIR`` at an empty tmp dir for every test.
+
+    ``installed_launchd_plist_path()`` (and through it ``is_system_domain_gateway_install()`` and the
+    fleet-scope plist check) reads ``/Library/LaunchDaemons``, which changes how the update path restarts
+    a gateway. On a developer's Mac that runs its gateways as LaunchDaemons, the real directory would
+    leak in and flip unrelated update tests — the same class of problem ``_suppress_concurrent_hermes_gate``
+    exists for. Tests that exercise the system-domain branch write their own plists into a dir they patch in.
+    """
+    try:
+        from hermes_cli import gateway as _gw
+    except Exception:
+        return
+    monkeypatch.setattr(
+        _gw,
+        "LAUNCHD_DAEMON_PLIST_DIR",
+        tmp_path_factory.mktemp("empty-LaunchDaemons"),
+        raising=False,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _suppress_concurrent_hermes_gate(request, monkeypatch):
     """Default ``_detect_concurrent_hermes_instances`` to ``[]`` for every test.
 

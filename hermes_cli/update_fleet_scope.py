@@ -131,9 +131,10 @@ def launchd_label_foreign_home(label: str, scope: set[Path] | None = None) -> st
     decides whether a job exists; only a proven foreign home is refused)."""
     import plistlib
     with suppress(Exception):
-        from hermes_cli.gateway import get_launchd_plist_path
-        plist_path = get_launchd_plist_path().with_name(f"{label}.plist")
-        if not plist_path.exists():
+        from hermes_cli.gateway import installed_launchd_plist_path
+        # LaunchAgent or LaunchDaemon: the system domain is probed too, so its plists are judged too.
+        plist_path = installed_launchd_plist_path(label)
+        if plist_path is None:
             return None
         data = plistlib.loads(plist_path.read_bytes())
         pinned = str(data["EnvironmentVariables"]["HERMES_HOME"])

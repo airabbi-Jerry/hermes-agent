@@ -205,6 +205,10 @@ def _get_service_pids(all_profiles: bool = False) -> set:
                 continue
             if pid is not None and pid > 0:
                 pids.add(pid)
+                # For a wrapped job launchd reports the stderr-timestamp wrapper; the gateway is its
+                # child and the ps scan finds it too. Unprotected, the manual sweep would drain the
+                # gateway launchd just respawned a second time (t_eae64b98). Protect-only, so safe.
+                pids.add(_resolve_supervised_gateway_pid(pid))
         if all_profiles:
             # Prefix scan also catches ai.hermes.gateway* agents the label derivation can't map
             # (renamed profiles, other installs). Over-inclusion is safe: PIDs are only protected.
@@ -1431,10 +1435,18 @@ def _launchd_service_registered(label: str, *, timeout: int = 5) -> bool:
 
 
 def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]:
-    """``(domain, pid)`` for ``label``, probing ``gui/<uid>`` then ``user/<uid>``. Never uses the current
-    profile's cached ``_launchd_domain()`` — a fleet can mix domains. ``TimeoutExpired`` propagates."""
+    """``(domain, pid)`` for ``label``, probing ``gui/<uid>``, ``user/<uid>``, then ``system``. Never uses
+    the current profile's cached ``_launchd_domain()`` — a fleet can mix domains. ``TimeoutExpired``
+    propagates. ``pid`` is launchd's own (the wrapper for a wrapped job), so fresh-PID checks against
+    ``_launchd_print_service_pid`` compare like with like.
+
+    ``system`` is probed last so per-user LaunchAgents keep winning. A ``/Library/LaunchDaemons`` gateway
+    lives only there; returning ``(None, None)`` for it made ``hermes update`` skip its restart AND, via
+    ``_get_service_pids()``, misclassify it as a manual gateway whose detached respawn watcher races
+    launchd's ``KeepAlive`` (t_eae64b98). ``main_dashboard._launchd_plist_dirs()`` maps LaunchDaemons to
+    ``system`` the same way."""
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
-    for domain in (f"gui/{uid}", f"user/{uid}"):
+    for domain in (f"gui/{uid}", f"user/{uid}", "system"):
         loaded, pid = _launchd_print_service_pid(domain, label)
         if loaded:
             return (domain, pid)
@@ -3505,6 +3517,11 @@ from hermes_cli.gateway_launchd import (  # noqa: E402,F401 — facade re-export
     LAUNCHD_SUPERVISION_VERIFY_TIMEOUT,
     wait_for_launchd_gateway_supervision,
     launchd_status,
+    LAUNCHD_DAEMON_PLIST_DIR,
+    installed_launchd_plist_path,
+    is_system_domain_gateway_install,
+    _resolve_supervised_gateway_pid,
+    launchctl_kickstart_hint,
 )
 
 

@@ -741,6 +741,70 @@ def _wait_for_launchd_service_pid(
         time.sleep(0.5)
 
 
+# System-domain jobs; module-level so tests redirect it on the facade (t_eae64b98).
+LAUNCHD_DAEMON_PLIST_DIR = Path("/Library/LaunchDaemons")
+
+
+def installed_launchd_plist_path(label: str) -> Path | None:
+    """The plist installing ``label``: the per-user LaunchAgent, else a ``/Library/LaunchDaemons`` job,
+    else None. LaunchAgent first, matching the domain order of ``_locate_launchd_gateway_service()``.
+    A filesystem read, never a ``launchctl`` probe."""
+    for candidate in (_gw().get_launchd_plist_path().with_name(f"{label}.plist"),
+                      _gw().LAUNCHD_DAEMON_PLIST_DIR / f"{label}.plist"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def is_system_domain_gateway_install() -> bool:
+    """True when the invoking profile's gateway is installed only as a LaunchDaemon (``system`` domain).
+
+    Such a job cannot take ``launchd_restart()``: its plist gate only sees ``~/Library/LaunchAgents``
+    and skips silently, and a ``system`` kickstart needs root. Filesystem-only on purpose — the fleet
+    restart decides this before any launchctl probe (a no-plist install never touches launchctl). The
+    LaunchAgent check is that gate's own ``get_launchd_plist_path().exists()``, so a LaunchAgent wins.
+    """
+    if _gw().get_launchd_plist_path().exists():
+        return False
+    return (_gw().LAUNCHD_DAEMON_PLIST_DIR / f"{_gw().get_launchd_label()}.plist").exists()
+
+
+def launchctl_kickstart_hint(domain: str, label: str) -> str:
+    """Manual recovery command for ``domain/label`` that works from the operator's shell: a ``system``
+    job can only be kickstarted by root (same rule as ``dashboard_procs``' restart hint)."""
+    sudo = "sudo " if domain == "system" and os.geteuid() != 0 else ""  # windows-footgun: ok — launchd jobs exist only on macOS
+    return f"{sudo}launchctl kickstart -k {domain}/{label}"
+
+
+def _resolve_supervised_gateway_pid(pid: int | None) -> int | None:
+    """The gateway under launchd's ``pid``: its gateway child when ``pid`` is the stderr-timestamp
+    wrapper, else ``pid`` unchanged.
+
+    Drains signal the gateway itself. The wrapper forwards SIGUSR1 since #101426, but a wrapper started
+    before that fix is still running during the post-update restart; SIGUSR1 kills it (default action)
+    and launchd SIGTERMs the group, so the gateway never drains. Both argv match the canonical gateway
+    matcher (the wrapper's tail is the gateway command), so only a matching CHILD marks a wrapper.
+    """
+    if not pid or pid <= 0:
+        return pid
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return pid
+    from gateway.status import looks_like_gateway_command_line
+    try:
+        proc = psutil.Process(pid)
+        if not looks_like_gateway_command_line(" ".join(proc.cmdline() or [])):
+            return pid
+        for child in proc.children(recursive=False):
+            with contextlib.suppress(psutil.Error):
+                if looks_like_gateway_command_line(" ".join(child.cmdline() or [])):
+                    return child.pid
+    except psutil.Error:
+        return pid
+    return pid
+
+
 def launchd_restart():
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()

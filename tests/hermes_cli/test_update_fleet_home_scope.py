@@ -93,3 +93,24 @@ def test_manual_gateway_of_another_home_is_not_stopped(monkeypatch, own_home):
     fleet._restart_manual_gateways(out, 5.0)
     assert killed == [(111, signal.SIGTERM)]
     assert out.killed_pids == {111}
+
+
+def test_launch_daemon_of_another_home_is_left_alone(monkeypatch, own_home, tmp_path):
+    """The fleet restart now probes launchd's ``system`` domain (t_eae64b98), so a LaunchDaemon is
+    judged by its plist's pinned HERMES_HOME like a LaunchAgent: a scratch home's update must not drain
+    the account's real daemons, and the updating home's own daemon stays in scope (control)."""
+    import plistlib
+    from hermes_cli import gateway
+    from hermes_cli.update_fleet_scope import launchd_label_foreign_home
+
+    agents, daemons = tmp_path / "LaunchAgents", tmp_path / "LaunchDaemons"
+    agents.mkdir()
+    daemons.mkdir()
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: agents / "ai.hermes.gateway.plist")
+    monkeypatch.setattr(gateway, "LAUNCHD_DAEMON_PLIST_DIR", daemons)
+    for label, home in (("ai.hermes.gateway", FOREIGN_HOME), ("ai.hermes.gateway-own", str(own_home))):
+        payload = {"Label": label, "EnvironmentVariables": {"HERMES_HOME": home}}
+        (daemons / f"{label}.plist").write_bytes(plistlib.dumps(payload))
+
+    assert launchd_label_foreign_home("ai.hermes.gateway") == FOREIGN_HOME
+    assert launchd_label_foreign_home("ai.hermes.gateway-own") is None

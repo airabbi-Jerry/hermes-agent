@@ -1070,6 +1070,24 @@ def _restart_launchd_gateway_after_update(
     return [], [current_label]
 
 
+def _hand_launchd_restart_to_ancestor(
+    label: str, pid: int, restarted_services: list, failed_or_stale_units: list, self_restart_pending: set | None,
+) -> None:
+    """Fire-and-forget SIGUSR1 to a launchd gateway this updater runs inside: a blocking drain is circular
+    (it waits on our own cron session), and a kickstart would kill this process. The gateway exits after
+    we do and KeepAlive respawns it on the new checkout."""
+    from hermes_cli.gateway import _request_gateway_self_restart
+    print(f"  → {label}: update is running inside this gateway's process tree — signalling restart "
+          "and letting the gateway drain itself (#100179)")
+    if not _request_gateway_self_restart(pid):
+        failed_or_stale_units.append(label)
+        print(f"  ⚠ {label}: could not signal PID {pid}. After this update exits: hermes gateway restart")
+        return
+    if self_restart_pending is not None:
+        self_restart_pending.add(pid)
+    restarted_services.append(label)
+
+
 def _restart_macos_launchd_gateways(
     restarted_services: list, failed_or_stale_units: list, drain_budget: float, *, require_supervision: bool = False,
     self_restart_pending: set | None = None,
@@ -1078,30 +1096,38 @@ def _restart_macos_launchd_gateways(
 
     The pull is shared across profiles, so every ``ai.hermes.gateway*`` LaunchAgent
     must reload it or siblings stay on pre-update ``sys.modules`` (systemd parity).
-    Invoking profile uses ``launchd_restart()``; siblings get the same drain-first
-    sequence with their domain (``gui/<uid>`` vs ``user/<uid>``) resolved per label so
-    none is kickstarted in the wrong domain. ``TimeoutExpired`` is isolated per label.
+    Invoking profile uses ``launchd_restart()`` unless it is a LaunchDaemon; siblings (and
+    that daemon) get the same drain-first sequence with their domain (``gui/<uid>``,
+    ``user/<uid>`` or ``system``) resolved per label so none is kickstarted in the wrong
+    domain. ``TimeoutExpired`` is isolated per label.
 
     See #41403.
-    The invoking profile keeps the existing ``launchd_restart()`` treatment (self-restart request → graceful
+    A LaunchAgent invoking profile keeps the existing ``launchd_restart()`` treatment (self-restart request → graceful
     drain → kickstart). ``subprocess.TimeoutExpired`` is isolated per label so one wedged launchctl call
     cannot leave the rest of the fleet on old code (#68523).
     """
     from hermes_cli.gateway import (
-        get_launchd_label, get_launchd_plist_path, launchd_gateway_labels_for_install, legacy_launchd_labels_for_install,
-        _graceful_restart_via_sigusr1, _launchd_kickstart,
-        _locate_launchd_gateway_service, _wait_for_launchd_service_pid,
+        get_launchd_label, installed_launchd_plist_path, launchd_gateway_labels_for_install, legacy_launchd_labels_for_install,
+        _graceful_restart_via_sigusr1, _launchd_kickstart, launchctl_kickstart_hint,
+        _locate_launchd_gateway_service, _wait_for_launchd_service_pid, is_system_domain_gateway_install,
+        _is_pid_ancestor_of_current_process, _resolve_supervised_gateway_pid,
     )
     if require_supervision:
         listing = subprocess.run(["launchctl", "list"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
         if listing.returncode != 0:
             failed_or_stale_units.append("launchd (listing failed)")
             return
-    _restarted, _failed = _restart_launchd_gateway_after_update(
-        supervision_verify=True, self_restart_pending=self_restart_pending)
-    restarted_services.extend(_restarted)
-    failed_or_stale_units.extend(_failed)
     current_label = get_launchd_label()
+    # A LaunchDaemon (``system`` domain) invoking profile cannot take ``launchd_restart()``: its plist
+    # gate sees only ~/Library/LaunchAgents and skips silently, and a ``system`` kickstart needs root.
+    # The per-label loop below restarts it without privileges (SIGUSR1 drain, KeepAlive respawn).
+    # Filesystem check, not a probe: nothing before this point may call launchctl (t_eae64b98).
+    current_is_system_daemon = is_system_domain_gateway_install()
+    if not current_is_system_daemon:
+        _restarted, _failed = _restart_launchd_gateway_after_update(
+            supervision_verify=True, self_restart_pending=self_restart_pending)
+        restarted_services.extend(_restarted)
+        failed_or_stale_units.extend(_failed)
 
     derived_labels = launchd_gateway_labels_for_install()
     # Units labelled before the profile-name suffix scheme (ai.hermes.gateway-<hash>) are invisible
@@ -1113,7 +1139,7 @@ def _restart_macos_launchd_gateways(
         print(f"  ↻ legacy-labelled units of this install join the restart: {', '.join(legacy_labels)}")
     from hermes_cli.update_fleet_scope import describe_skipped_runtime, launchd_label_foreign_home
     for label in derived_labels + legacy_labels:
-        if label == current_label:
+        if label == current_label and not current_is_system_daemon:
             continue
         # Labels are account-global: root B's default profile derives the same bare label root A
         # installed. A plist pinning a foreign HERMES_HOME is another install's job (#93349).
@@ -1125,16 +1151,24 @@ def _restart_macos_launchd_gateways(
             # reuse that domain so a sibling is never probed in one and restarted in another.
             domain, old_pid = _locate_launchd_gateway_service(label)
             if domain is None:
-                if require_supervision and get_launchd_plist_path().with_name(f"{label}.plist").exists():
+                if require_supervision and installed_launchd_plist_path(label) is not None:
                     failed_or_stale_units.append(label)
                 continue  # A profile without an installed job has no restart target.
+            # Signal the gateway, not launchd's wrapper; fresh-PID checks below stay on launchd's pid.
+            gateway_pid = _resolve_supervised_gateway_pid(old_pid)
+            if gateway_pid is not None and _is_pid_ancestor_of_current_process(gateway_pid):
+                # In practice the system-daemon invoking profile (it skipped launchd_restart()): the same
+                # in-tree hand-off launchd_restart() gives a LaunchAgent (#100179), pending for the matrix (#119597).
+                _hand_launchd_restart_to_ancestor(
+                    label, gateway_pid, restarted_services, failed_or_stale_units, self_restart_pending)
+                continue
             graceful_ok = False
-            if old_pid is not None and old_pid > 0:
+            if gateway_pid is not None and gateway_pid > 0:
                 print(f"  → {label}: draining (up to {int(drain_budget)}s)...")
                 from hermes_cli.update_cmd_drain_report import drain_progress_reporter
                 graceful_ok = _graceful_restart_via_sigusr1(
-                    old_pid, drain_timeout=drain_budget,
-                    on_progress=drain_progress_reporter(_gateway_home_for_pid(old_pid), budget_s=drain_budget))
+                    gateway_pid, drain_timeout=drain_budget,
+                    on_progress=drain_progress_reporter(_gateway_home_for_pid(gateway_pid), budget_s=drain_budget))
             if graceful_ok and _wait_for_launchd_service_pid(label, old_pid=old_pid, timeout=10.0, domain=domain):
                 # KeepAlive already respawned it on new code — a kickstart would kill it.
                 restarted_services.append(label)
@@ -1146,7 +1180,7 @@ def _restart_macos_launchd_gateways(
                 failed_or_stale_units.append(label)
                 print(
                     f"  ⚠ Failed to restart {label}: {stderr}\n"
-                    f"    Recover manually: launchctl kickstart -k {domain}/{label}"
+                    f"    Recover manually: {launchctl_kickstart_hint(domain, label)}"
                 )
                 continue
             if _wait_for_launchd_service_pid(label, old_pid=old_pid, timeout=15.0, domain=domain):
@@ -1155,7 +1189,7 @@ def _restart_macos_launchd_gateways(
                 failed_or_stale_units.append(label)
                 print(
                     f"  ✗ {label} failed to come back after restart.\n"
-                    f"    Check logs, then: launchctl kickstart -k {domain}/{label}"
+                    f"    Check logs, then: {launchctl_kickstart_hint(domain, label)}"
                 )
         except subprocess.TimeoutExpired:
             failed_or_stale_units.append(label)

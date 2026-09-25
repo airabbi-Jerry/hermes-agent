@@ -161,6 +161,60 @@ class TestLocateLaunchdGatewayService:
             _locate_launchd_gateway_service("ai.hermes.gateway-x")
 
 
+class TestSystemDomainLaunchDaemons:
+    """Blocker 3 (Kanban t_eae64b98): a gateway installed as a ``/Library/LaunchDaemons`` job.
+
+    The per-user-only domain probe returned ``(None, None)`` for such a label. That was not merely "no
+    restart": ``_get_service_pids()`` then protected nothing, so the post-update sweep treated the daemon
+    as a *manual* gateway and armed a detached respawn watcher racing launchd's ``KeepAlive``.
+    """
+
+    def test_system_domain_is_the_fallback_after_the_per_user_domains(self, monkeypatch):
+        loaded_in: set[str] = set()
+
+        def fake_run(cmd, **kwargs):
+            domain = cmd[2].rpartition("/")[0]
+            return _completed(0, PRINT_RUNNING) if domain in loaded_in else _completed(113)
+
+        monkeypatch.setattr(gw.subprocess, "run", fake_run)
+        loaded_in.add("system")
+        assert _locate_launchd_gateway_service("ai.hermes.gateway") == ("system", 4242)
+        # Loaded per-user too: the LaunchAgent keeps winning.
+        loaded_in.add(f"user/{UID}")
+        assert _locate_launchd_gateway_service("ai.hermes.gateway") == (f"user/{UID}", 4242)
+
+    def test_is_system_domain_install_prefers_a_launchagent(self, monkeypatch, tmp_path):
+        agents, daemons = tmp_path / "LaunchAgents", tmp_path / "LaunchDaemons"
+        agents.mkdir()
+        daemons.mkdir()
+        monkeypatch.setattr(gw, "LAUNCHD_DAEMON_PLIST_DIR", daemons)
+        monkeypatch.setattr(gw, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gw, "get_launchd_plist_path",
+                            lambda: agents / "ai.hermes.gateway.plist")
+
+        assert gw.is_system_domain_gateway_install() is False
+        (daemons / "ai.hermes.gateway.plist").write_text("<plist/>")
+        assert gw.is_system_domain_gateway_install() is True
+        (agents / "ai.hermes.gateway.plist").write_text("<plist/>")
+        assert gw.is_system_domain_gateway_install() is False
+
+    def test_wrapped_daemon_protects_wrapper_and_gateway_from_the_sweep(self, monkeypatch):
+        """launchd reports the stderr-timestamp wrapper; the ps scan also finds its gateway child. Left
+        unprotected, the manual sweep would drain the gateway launchd just respawned a second time."""
+        monkeypatch.setattr(gw, "is_macos", lambda: True)
+        monkeypatch.setattr(gw, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gw, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gw, "launchd_gateway_labels_for_install",
+                            lambda: ["ai.hermes.gateway", "ai.hermes.gateway-melody"])
+        located = {"ai.hermes.gateway": ("system", 4242), "ai.hermes.gateway-melody": ("system", 5252)}
+        monkeypatch.setattr(gw, "_locate_launchd_gateway_service", lambda label: located[label])
+        monkeypatch.setattr(gw, "_resolve_supervised_gateway_pid",
+                            lambda pid: 4343 if pid == 4242 else pid)
+        monkeypatch.setattr(gw.subprocess, "run", lambda *a, **k: _completed(113))
+
+        assert gw._get_service_pids(all_profiles=True) == {4242, 4343, 5252}
+
+
 class TestProbeLaunchdDomainForLabel:
     def test_unloaded_label_falls_back_to_managername(self, monkeypatch):
         def fake_run(cmd, **kwargs):
@@ -205,6 +259,7 @@ class TestGetServicePidsScoping:
         monkeypatch.setattr(
             gw, "_locate_launchd_gateway_service", lambda label: located[label]
         )
+        monkeypatch.setattr(gw, "_resolve_supervised_gateway_pid", lambda pid: pid)
 
     def test_all_profiles_returns_every_gateway_service_pid(self, monkeypatch):
         """The update sweep's exclude-set must protect ALL freshly-restarted
@@ -223,9 +278,9 @@ class TestGetServicePidsScoping:
 
 
 def _fleet(monkeypatch, tmp_path, *, current, labels, located,
-           registered=None, plist_exists=True,
+           registered=None, plist_exists=True, daemon_plists=(),
            drain_results=None, kick_errors=None, wait_results=None,
-           current_supervised=True, legacy_labels=()):
+           current_supervised=True, legacy_labels=(), wrapped=None, ancestors=()):
     """Wire a fake launchd fleet through hermes_cli.gateway seams.
 
     ``located`` maps label -> (domain, pid) as ``_locate_launchd_gateway_service``
@@ -233,18 +288,33 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
     maps label -> bool for the current-profile ``launchctl list`` gate and
     defaults to "located in some domain". Returns a SimpleNamespace of
     recorder lists: rec.kickstarts, rec.drains, rec.current_restarts, rec.waits, locates,
-    registered_checks.
+    registered_checks. ``daemon_plists`` names labels installed under the (tmp) LaunchDaemons dir;
+    ``wrapped`` maps a launchd (wrapper) pid to its gateway child; ``ancestors`` are pids this
+    updater runs inside.
     """
     from types import SimpleNamespace
 
     rec = SimpleNamespace(
         kickstarts=[], drains=[], current_restarts=[], waits=[],
         locates=[], registered_checks=[], current_verifies=[],
+        wait_old_pids=[], self_restarts=[],
     )
 
     plist = tmp_path / f"{current}.plist"
     if plist_exists:
         plist.write_text("<plist/>")
+
+    daemon_dir = tmp_path / "LaunchDaemons"
+    daemon_dir.mkdir()
+    for _label in daemon_plists:
+        (daemon_dir / f"{_label}.plist").write_text("<plist/>")
+    monkeypatch.setattr(gw, "LAUNCHD_DAEMON_PLIST_DIR", daemon_dir)
+    # Fake pids must never reach psutil or the real process tree.
+    monkeypatch.setattr(gw, "_resolve_supervised_gateway_pid", lambda pid: (wrapped or {}).get(pid, pid))
+    monkeypatch.setattr(gw, "_is_pid_ancestor_of_current_process", lambda pid: pid in ancestors)
+    monkeypatch.setattr(
+        gw, "_request_gateway_self_restart", lambda pid: (rec.self_restarts.append(pid), True)[1]
+    )
 
     def fake_locate(label):
         rec.locates.append(label)
@@ -288,6 +358,7 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
 
     def fake_wait(label, old_pid, timeout, domain):
         rec.waits.append(f"{domain}/{label}")
+        rec.wait_old_pids.append(old_pid)
         return (wait_results or {}).get(label, True)
 
     monkeypatch.setattr(gw, "_wait_for_launchd_service_pid", fake_wait)
@@ -310,6 +381,72 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
 
 
 class TestRestartMacosLaunchdGateways:
+    def test_system_daemon_current_profile_goes_through_the_per_label_loop(
+        self, monkeypatch, tmp_path
+    ):
+        """A LaunchDaemon invoking profile must NOT take ``launchd_restart()`` (t_eae64b98).
+
+        Its plist gate only sees ~/Library/LaunchAgents, so it returned ``[], []`` and silently skipped
+        the restart; and a ``system`` kickstart needs root, which an unattended update lacks. The loop
+        drains with SIGUSR1 and lets ``KeepAlive`` respawn. For the wrapped job the SIGUSR1 goes to the
+        gateway (a pre-#101426 wrapper dies on it), while the fresh-PID check stays on launchd's pid.
+        """
+        current, melody = "ai.hermes.gateway", "ai.hermes.gateway-melody"
+        rec = _fleet(
+            monkeypatch,
+            tmp_path,
+            current=current,
+            labels=[current, melody],
+            located={current: ("system", 100), melody: ("system", 200)},
+            plist_exists=False,                       # no LaunchAgent — daemon-only install
+            daemon_plists=[current, melody],
+            wrapped={100: 101},                       # launchd runs the wrapper; 101 is the gateway
+            drain_results={101: True, 200: True},
+        )
+        restarted: list[str] = []
+        failed: list[str] = []
+
+        _restart_macos_launchd_gateways(restarted, failed, drain_budget=0.0)
+
+        assert rec.current_restarts == []             # launchd_restart() not used
+        assert rec.drains == [101, 200]               # the invoking profile is drained too
+        assert rec.wait_old_pids == [100, 200]        # respawn judged on launchd's own pid
+        assert rec.kickstarts == []                   # KeepAlive respawned: no root needed
+        assert sorted(restarted) == [current, melody]
+        assert failed == []
+
+    def test_update_inside_the_system_daemon_hands_it_a_deferred_restart(
+        self, monkeypatch, tmp_path
+    ):
+        """The updater runs inside the daemon's tree (cron/kanban under the gateway, #100179).
+
+        A blocking drain there is circular and a kickstart would kill the updater: the daemon gets the
+        same fire-and-forget SIGUSR1 ``launchd_restart()`` gives a LaunchAgent, recorded as pending for
+        the fleet matrix (#119597).
+        """
+        current = "ai.hermes.gateway"
+        rec = _fleet(
+            monkeypatch,
+            tmp_path,
+            current=current,
+            labels=[current],
+            located={current: ("system", 100)},
+            plist_exists=False,
+            daemon_plists=[current],
+            wrapped={100: 101},
+            ancestors={100, 101},
+        )
+        restarted: list[str] = []
+        failed: list[str] = []
+        pending: set[int] = set()
+
+        _restart_macos_launchd_gateways(restarted, failed, drain_budget=0.0, self_restart_pending=pending)
+
+        assert rec.self_restarts == [101]
+        assert pending == {101}
+        assert rec.drains == [] and rec.kickstarts == []
+        assert restarted == [current] and failed == []
+
     def test_current_delegates_and_siblings_kickstart_in_own_domains(
         self, monkeypatch, tmp_path
     ):
