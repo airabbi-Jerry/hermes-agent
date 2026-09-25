@@ -29,6 +29,40 @@ def _agent_session_source(agent: Any) -> str:
     return _session_source_for_agent(getattr(agent, "platform", None))
 
 
+def _enforce_state_ceiling(agent, prompt_tokens: int) -> None:
+    """Stop a tool loop that has spent its *state* budget, using the provider's own count.
+
+    Callers with a hard single-request budget (a cron gate that must hand its state to a
+    downstream 32K judge) set ``agent._state_ceiling_tokens``. Nothing happens without it.
+
+    Why a ceiling is needed on top of compaction and an iteration cap: neither bounds state.
+    Reclamation can decline — the deterministic prune runs out of eligible non-tail tool
+    results, and an LLM compaction pass can return a summary larger than its input, which the
+    compressor refuses until the attempt budget is spent. An iteration cap does not bound it
+    either, because one iteration is not one tool result: a single assistant message with
+    several parallel tool calls appended +10,893 tokens in one step on the measured gate.
+
+    ``prompt_tokens`` is what the provider just billed, so this is the one figure that cannot
+    drift. Crossing the ceiling lowers ``max_iterations`` to the calls already made, which ends
+    the turn through the existing iteration-exhaustion path: the model is asked for a final
+    answer rather than cut off mid-thought. Set the ceiling BELOW the real budget — that final
+    call still has to fit.
+    """
+    ceiling = int(getattr(agent, "_state_ceiling_tokens", 0) or 0)
+    if ceiling <= 0 or int(prompt_tokens or 0) < ceiling:
+        return
+    used = int(getattr(agent, "session_api_calls", 0) or 0)
+    current = int(getattr(agent, "max_iterations", 0) or 0)
+    if used <= 0 or (0 < current <= used):
+        return  # already winding down
+    agent.max_iterations = used
+    logger.warning(
+        "State ceiling reached: request was %s tokens >= ceiling %s. Ending the turn after "
+        "%s API calls (was allowed %s) — the model will be asked for a final answer.",
+        f"{int(prompt_tokens):,}", f"{ceiling:,}", used, current,
+    )
+
+
 @dataclass
 class ResponseUsageOutcome:
     """``compression_attempts`` is the (possibly rearmed-to-zero) budget counter;
@@ -171,6 +205,12 @@ def record_response_usage(
         compressor._context_probe_persistable = False
 
     agent.session_prompt_tokens += prompt_tokens
+    # Single-request state high-water mark (see _USAGE_STATE): what has to fit the context window.
+    agent.session_peak_prompt_tokens = max(
+        int(getattr(agent, "session_peak_prompt_tokens", 0) or 0), int(prompt_tokens or 0)
+    )
+    agent.session_last_prompt_tokens = int(prompt_tokens or 0)
+    _enforce_state_ceiling(agent, prompt_tokens)
     agent.session_completion_tokens += completion_tokens
     agent.session_total_tokens += total_tokens
     agent.session_input_tokens += canonical_usage.input_tokens

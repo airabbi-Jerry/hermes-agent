@@ -2268,6 +2268,11 @@ _USAGE_STATE: Dict[str, Any] = {
     "_request_pressure_anchored": False,  # whether the last pressure figure came from the anchor
     # Cumulative token usage for the session
     "session_prompt_tokens": 0,
+    # State = the context actually sent on ONE request. session_prompt_tokens is the SUM over
+    # every API call of a run, so it grows ~quadratically with turn count and says nothing about
+    # whether a single request fits a 32K/64K window. These two track the single-request figure.
+    "session_peak_prompt_tokens": 0,
+    "session_last_prompt_tokens": 0,
     "session_completion_tokens": 0,
     "session_total_tokens": 0,
     "session_api_calls": 0,

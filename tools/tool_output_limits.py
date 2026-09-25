@@ -6,7 +6,8 @@ raises, so behaviour is unchanged when the section is absent or malformed."""
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from contextvars import ContextVar
+from typing import Any, Dict, Optional
 
 from hermes_constants import hermes_home_key
 
@@ -59,6 +60,26 @@ def _reset_tool_output_limits_cache() -> None:
     _cached_limits.clear()
 
 
-def get_max_bytes() -> int: return get_tool_output_limits()["max_bytes"]
+# Per-run override for ``max_bytes``, for callers that run under a hard context budget where a
+# single 50,000-char tool result is a large fraction of the whole allowance. A ContextVar (not a
+# module global) because cron runs jobs concurrently in the same process: the value must follow
+# one run's context and be invisible to every other job. ``None`` = use the configured limit.
+_max_bytes_override: ContextVar[Optional[int]] = ContextVar(
+    "hermes_tool_output_max_bytes_override", default=None)
+
+
+def set_max_bytes_override(value: Optional[int]):
+    """Override ``max_bytes`` for the current context. Returns the token to reset with."""
+    return _max_bytes_override.set(
+        None if value is None else max(1, int(value)))
+
+
+def reset_max_bytes_override(token) -> None:
+    _max_bytes_override.reset(token)
+
+
+def get_max_bytes() -> int:
+    override = _max_bytes_override.get()
+    return override if override is not None else get_tool_output_limits()["max_bytes"]
 def get_max_lines() -> int: return get_tool_output_limits()["max_lines"]
 def get_max_line_length() -> int: return get_tool_output_limits()["max_line_length"]

@@ -2405,6 +2405,159 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     return setup
 
 
+# Per-job state budget → compressor trigger points, as fractions of the budget.
+#
+# Both triggers are checked BETWEEN iterations, so the peak request is always
+# ``trigger + one iteration's growth``. On the measured gate a single iteration added up to
+# ~8.7K tokens (one 9KB tool result plus its reasoning), so a trigger set near the budget
+# overshoots it every time: at 0.88 the first budgeted run peaked at 33,894 against a 32,000
+# budget. The compaction trigger therefore has to sit a whole worst-case iteration below the
+# budget, not just under it.
+#
+# Prune first and often (deterministic, no LLM call, tail preserved by message count); full
+# compaction is the backstop for growth that is not in prunable tool results. That order matters
+# for more than cost: a small/fast model asked to summarise a dense transcript can return
+# something LARGER than the input, which the compressor then refuses — three such refusals
+# exhaust the attempt budget and leave nothing reclaiming at all.
+_STATE_BUDGET_PRUNE_RATIO = 0.45
+_STATE_BUDGET_COMPACT_RATIO = 0.70
+# A prune commit breaks the prompt-cache prefix, so it must reclaim something worth the break.
+# The global default (4096) is tuned for 200K+ windows; at a 32K budget it declined every prune
+# the measured run attempted ("reclaim_below_minimum"), so the budget scales it down.
+_STATE_BUDGET_MIN_RECLAIM_RATIO = 0.015
+# Tail protected from the prune, in messages. The global default (20) covers ~10 tool
+# call/result pairs — at this budget that is the entire transcript, so the prune finds nothing
+# eligible. 6 still keeps the three most recent exchanges verbatim.
+_STATE_BUDGET_PROTECT_LAST_N = 6
+# Tool results below this many chars are left alone by the prune's summarize pass. The 8000-char
+# global default leaves a run made of many medium-sized results (this gate's shape) with nothing
+# eligible while state keeps climbing.
+_STATE_BUDGET_MIN_RESULT_CHARS = 600
+
+# Iteration ceiling. Reclamation alone cannot bound state, because both reclamation paths can
+# decline for reasons outside our control: the deterministic prune runs out of eligible
+# non-tail tool results ("nothing_eligible"), and LLM compaction can return a summary LARGER
+# than its input — three refusals and the attempt budget is spent, after which nothing reclaims
+# and state climbs freely to the end of the run. Measured on the gate at a 32,000 budget: peaks
+# of 33,894 (compact trigger 28,160) and 33,402 (trigger 22,400). Lowering the trigger did not
+# lower the peak; it only lengthened the exhausted-compaction tail. Iterations are the one
+# quantity that is ours to bound.
+#
+# ``growth_per_iteration``: measured net growth of one iteration WITH reclamation active,
+# ~352 tokens/call over the two budgeted runs. Rounded up for headroom.
+_STATE_BUDGET_GROWTH_PER_ITERATION = 420
+# First request of a run is overhead + job prompt + script output; nothing can shrink it.
+_STATE_BUDGET_FIRST_REQUEST_TOKENS = 14_100
+# Never cut a run so short it cannot do the work; below this the ceiling is not worth applying.
+_STATE_BUDGET_MIN_ITERATIONS = 12
+
+# Hard state ceiling, as a fraction of the budget: the watermark at which the turn stops asking
+# for more tool calls (agent/turn_usage.py::_enforce_state_ceiling). This is the only bound that
+# holds when reclamation has declined AND one iteration can add ~11K tokens. The gap to 1.0 is
+# the headroom for the one remaining call — the final-answer request — which still has to fit.
+_STATE_BUDGET_CEILING_RATIO = 0.82
+
+# Single tool result cap, in chars, as a fraction of the budget. Neither the triggers nor the
+# iteration ceiling can stop ONE oversized result: measured on the gate, iteration 28 of a run
+# sitting at 22,590 jumped to 33,483 — +10,893 tokens from a single terminal call, straight
+# through the budget in one step. The global default caps terminal output at 50,000 chars, which
+# is a third of a 32,000-token budget on its own.
+#
+# 0.5 chars-per-budget-token (16,000 chars at a 32,000 budget) is deliberately not tighter: the
+# gate's own evidence source, ``kanban_signal_digest.py --cards``, returns ~14KB, and truncating
+# THAT would make the gate judge cards on partial data. The cap exists to stop a stray 40KB
+# ``grep``/``tail``, not to ration the digest.
+_STATE_BUDGET_TOOL_OUTPUT_CHARS_RATIO = 0.5
+
+
+def _apply_cron_state_budget(agent, job: dict, job_id: str) -> Optional[dict]:
+    """Bind this run's *state* (single-request context) to the job's ``state_budget_tokens``.
+
+    Why a per-job budget exists at all: compaction triggers are derived from the MODEL's window.
+    On a 1.3M-token window nothing ever fires, so a long tool loop re-sends a context that grows
+    without bound — fine for the model, fatal for a gate that has to hand its state to a
+    downstream 32K/64K judge. The budget is a policy limit, unrelated to what the model can hold.
+
+    Rather than a second compaction implementation, this re-points the existing machinery at the
+    budget: ``threshold_tokens_cap`` is the absolute-token cap the compressor already honours, and
+    ``proactive_prune_tokens`` is the deterministic no-LLM tool-result prune that protects the tail
+    by message count. The gate keeps all of its tools and never stops early — old tool output it
+    has already acted on stops being re-sent.
+
+    No-op (returns None) unless the job sets ``state_budget_tokens``, so every other cron job is
+    byte-identical. Returns the applied trigger points for the audit row.
+    """
+    try:
+        budget = int(job.get("state_budget_tokens") or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    if budget <= 0:
+        return None
+    comp = getattr(agent, "context_compressor", None)
+    if comp is None:
+        logger.warning("Job '%s': state_budget_tokens set but no context engine to apply it to", job_id)
+        return None
+
+    prune_at = max(1, int(budget * _STATE_BUDGET_PRUNE_RATIO))
+    compact_at = max(1, int(budget * _STATE_BUDGET_COMPACT_RATIO))
+    applied = {"state_budget_tokens": budget, "state_prune_at": prune_at, "state_compact_at": compact_at}
+    try:
+        comp.threshold_tokens_cap = compact_at
+        comp._apply_threshold_tokens_cap()
+        comp.proactive_prune_tokens = prune_at
+        comp.proactive_prune_min_reclaim_tokens = max(
+            200, int(budget * _STATE_BUDGET_MIN_RECLAIM_RATIO)
+        )
+        comp.proactive_prune_min_result_chars = _STATE_BUDGET_MIN_RESULT_CHARS
+        comp.protect_last_n = min(int(comp.protect_last_n or 0) or _STATE_BUDGET_PROTECT_LAST_N,
+                                  _STATE_BUDGET_PROTECT_LAST_N)
+    except Exception as e:
+        logger.warning("Job '%s': could not apply state budget: %s", job_id, e)
+        return None
+
+    # Iteration ceiling: the bound that does not depend on a model agreeing to summarise itself.
+    # The run ends the way an exhausted iteration budget already ends — the model is asked for a
+    # final answer — which this job handles today (it hits the global 60-iteration cap routinely).
+    # Unfinished candidates stay on their Kanban cards and the digest's ack-gate keeps them
+    # ``fresh``, so the next fire resumes them: nothing is dropped, the gate is not disabled.
+    ceiling = job.get("state_budget_max_iterations")
+    if ceiling is None:
+        ceiling = (budget - _STATE_BUDGET_FIRST_REQUEST_TOKENS) // _STATE_BUDGET_GROWTH_PER_ITERATION
+    try:
+        ceiling = max(_STATE_BUDGET_MIN_ITERATIONS, int(ceiling))
+    except (TypeError, ValueError):
+        ceiling = _STATE_BUDGET_MIN_ITERATIONS
+    current = int(getattr(agent, "max_iterations", 0) or 0)
+    if current <= 0 or ceiling < current:
+        agent.max_iterations = ceiling
+        applied["state_max_iterations"] = ceiling
+
+    state_ceiling = max(1, int(budget * _STATE_BUDGET_CEILING_RATIO))
+    agent._state_ceiling_tokens = state_ceiling
+    applied["state_ceiling_tokens"] = state_ceiling
+
+    tool_chars = int(budget * _STATE_BUDGET_TOOL_OUTPUT_CHARS_RATIO)
+    with contextlib.suppress(Exception):
+        from tools.tool_output_limits import get_max_bytes, set_max_bytes_override
+        if tool_chars < get_max_bytes():
+            # Token returned for run_job's finally; the override must not outlive this run.
+            applied["_tool_output_token"] = set_max_bytes_override(tool_chars)
+            applied["state_tool_output_chars"] = tool_chars
+
+    logger.info(
+        "Job '%s': state budget %s tokens (prune >= %s, compact >= %s, max_iterations %s -> %s; "
+        "model window %s)",
+        job_id, f"{budget:,}", f"{prune_at:,}", f"{compact_at:,}", current,
+        int(getattr(agent, "max_iterations", 0) or 0),
+        f"{int(getattr(comp, 'context_length', 0) or 0):,}")
+    return applied
+    logger.info(
+        "Job '%s': state budget %s tokens (prune >= %s, compact >= %s; model window %s)",
+        job_id, f"{budget:,}", f"{prune_at:,}", f"{compact_at:,}",
+        f"{int(getattr(comp, 'context_length', 0) or 0):,}")
+    return applied
+
+
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
@@ -2445,10 +2598,45 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
 class _FireAudit:
     """One usage_audit.jsonl line per fire (created once the agent exists; fire id + start clock)."""
 
-    def __init__(self, job: dict, job_id: str, model: str):
+    def __init__(self, job: dict, job_id: str, model: str, agent: Any = None,
+                 state_budget: Optional[dict] = None):
         self.job, self.job_id, self.model = job, job_id, model
+        self.agent = agent
+        # Underscore keys are run-scoped handles (e.g. the tool-output override token), not audit data.
+        self.state_budget = {k: v for k, v in (state_budget or {}).items() if not k.startswith("_")}
         self.fire_id = uuid.uuid4().hex
         self.t_start = time.monotonic()
+
+    def _state_fields(self, result: dict) -> dict:
+        """Single-request context size ("state"), separate from the run's summed ``total_tokens``.
+
+        ``total_tokens`` is Σ over API calls, so it tells you what a run cost, never whether one
+        request fits the window. Gates with a hard state budget (Jev: 64K context / 32K state) need
+        the high-water mark of ONE request plus where those tokens came from.
+        """
+        agent = self.agent
+        if agent is None:
+            return {}
+        out = {
+            "state_peak_tokens": int(getattr(agent, "session_peak_prompt_tokens", 0) or 0),
+            "state_final_tokens": int(getattr(agent, "session_last_prompt_tokens", 0) or 0),
+            "api_calls": int(getattr(agent, "session_api_calls", 0) or 0),
+            **self.state_budget,
+        }
+        comp = getattr(agent, "context_compressor", None)
+        if comp is not None:
+            out["compressions"] = int(getattr(comp, "compression_count", 0) or 0)
+        try:
+            from agent.context_breakdown import compute_session_context_breakdown
+            messages = result.get("messages") if isinstance(result, dict) else None
+            payload = compute_session_context_breakdown(agent, list(messages or []))
+            out["state_breakdown"] = {
+                str(c.get("id")): int(c.get("tokens") or 0) for c in (payload.get("categories") or [])
+            }
+            out["state_estimated_total"] = int(payload.get("estimated_total") or 0)
+        except Exception as e:  # breakdown is diagnostics; never fail a fire over it
+            logger.debug("state breakdown unavailable: %s", e)
+        return out
 
     def write(self, result: dict, error: Optional[str]) -> None:
         _write_usage_audit({
@@ -2458,6 +2646,7 @@ class _FireAudit:
             "prompt_tokens": result.get("prompt_tokens"),
             "completion_tokens": result.get("completion_tokens"),
             "total_tokens": result.get("total_tokens"),
+            **self._state_fields(result),
             "response_silent": bool(result.get("response_silent")),
             "deliver_target": self.job.get("deliver"),
             "model": self.model or None,
@@ -2501,6 +2690,7 @@ def run_job(
     model = ""
     _session_db = None
     _audit: Optional[_FireAudit] = None
+    _state_budget: Optional[dict] = None
     _worker_state: dict = {}
     scope = _CronRunScope(job, job_id, execution_id)
     try:
@@ -2522,7 +2712,8 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
-        _audit = _FireAudit(job, job_id, model)
+        _state_budget = _apply_cron_state_budget(agent, job, job_id)
+        _audit = _FireAudit(job, job_id, model, agent, _state_budget)
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
@@ -2569,6 +2760,11 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        # Release the run-scoped tool-output cap before anything else can run in this context.
+        if isinstance(_state_budget, dict) and _state_budget.get("_tool_output_token") is not None:
+            with contextlib.suppress(Exception):
+                from tools.tool_output_limits import reset_max_bytes_override
+                reset_max_bytes_override(_state_budget["_tool_output_token"])
         from cron.scheduler_detached_worker import defer_teardown_to_running_worker
         _worker_teardown_deferred = defer_teardown_to_running_worker(
             _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id)
