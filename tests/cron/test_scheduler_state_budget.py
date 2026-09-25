@@ -1,5 +1,7 @@
 """Per-job state budget: the run-scoped tool-output cap reaches read_file only for budgeted jobs."""
 
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,11 +11,12 @@ from tools import tool_output_limits as tol
 
 
 @pytest.fixture
-def configured_max_bytes(monkeypatch):
+def configured_max_bytes():
     """Config ``tool_output.max_bytes`` stricter than the budget-derived cap (the live setup)."""
-    monkeypatch.setattr(tol, "_cached_limits", {"max_bytes": 8_000, "max_lines": 2000,
-                                                "max_line_length": 2000})
-    return 8_000
+    Path(os.environ["HERMES_HOME"], "config.yaml").write_text("tool_output:\n  max_bytes: 8000\n")
+    tol._reset_tool_output_limits_cache()
+    yield 8_000
+    tol._reset_tool_output_limits_cache()
 
 
 def _agent():

@@ -2553,11 +2553,6 @@ def _apply_cron_state_budget(agent, job: dict, job_id: str) -> Optional[dict]:
         int(getattr(agent, "max_iterations", 0) or 0),
         f"{int(getattr(comp, 'context_length', 0) or 0):,}")
     return applied
-    logger.info(
-        "Job '%s': state budget %s tokens (prune >= %s, compact >= %s; model window %s)",
-        job_id, f"{budget:,}", f"{prune_at:,}", f"{compact_at:,}",
-        f"{int(getattr(comp, 'context_length', 0) or 0):,}")
-    return applied
 
 
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
