@@ -28,6 +28,20 @@ except ImportError:
     _HAS_LARK_OAPI = False
 
 
+@pytest.fixture(autouse=True)
+def _env_wipes_stay_in_the_isolated_home(monkeypatch):
+    """Most tests here run under ``patch.dict(os.environ, ..., clear=True)``, which also wipes the
+    suite's isolated ``HERMES_HOME``. Identity files (the reconnect watchdog's runtime status) then
+    fell back to the platform default home — the developer's real ``~/.hermes`` — and a test run
+    overwrote a live gateway's ``gateway_state.json``. Point that fallback at the isolated home."""
+    import gateway.status
+    import hermes_constants
+
+    home = Path(os.environ["HERMES_HOME"])
+    monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway.status, "_get_platform_default_hermes_home", lambda: home)
+
+
 class _FakeRequestContent:
     def __init__(self, body: bytes):
         self.body = body
