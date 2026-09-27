@@ -9,6 +9,7 @@ did and returns a ``CompactionOutcome``. Predicates/estimators that tests patch 
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from dataclasses import dataclass
@@ -140,6 +141,20 @@ def run_turn_start_compaction(
     return out
 
 
+def _idle_reference_ts(agent: Any) -> float:
+    """Consume the host-supplied ``_idle_compact_reference_ts`` (gateway: last activity before
+    this turn's reset) when it is a real timestamp; otherwise ``_last_activity_ts``."""
+    ref = getattr(agent, "_idle_compact_reference_ts", None)
+    with contextlib.suppress(Exception):
+        agent._idle_compact_reference_ts = None
+    if isinstance(ref, (int, float)) and not isinstance(ref, bool) and ref > 0:
+        return float(ref)
+    last = getattr(agent, "_last_activity_ts", None)
+    if isinstance(last, (int, float)) and not isinstance(last, bool):
+        return float(last)
+    return time.time()
+
+
 def _idle_compaction(
     agent: Any, out: CompactionOutcome, system_message: Optional[str], user_message: Any,
     effective_task_id: str,
@@ -149,10 +164,13 @@ def _idle_compaction(
     from agent import turn_context as _tc
 
     messages = out.messages
+    # One-shot: the gateway resets ``_last_activity_ts`` at turn start (and a fresh agent starts it
+    # at construction), so it hands over the previous activity stamp here instead.
+    _reference_ts = _idle_reference_ts(agent)
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if not (agent.compression_enabled and _idle_after > 0 and messages):
         return
-    _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
+    _idle_gap = time.time() - _reference_ts
     if _idle_gap < _idle_after:
         return
     _compressor = agent.context_compressor

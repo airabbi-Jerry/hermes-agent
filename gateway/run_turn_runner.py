@@ -1036,6 +1036,19 @@ class TurnRunner:
                 count = row.get("message_count", 0)
         return count
 
+    def _durable_last_activity_ts(self):
+        """The session's durable ``last_activity_at`` (or None) — the idle-compaction reference for a
+        freshly built agent, whose in-memory activity clock starts at construction time."""
+        ctx = self._ctx
+        if self._runner._session_db is None or not ctx.session_id:
+            return None
+        with suppress(Exception):
+            row = self._runner._session_db._db.get_session(ctx.session_id)
+            ts = row.get("last_activity_at") if row else None
+            if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > 0:
+                return float(ts)
+        return None
+
     def _pop_cached_agent_for_eviction(self):
         """Evict under the lock but DEFER release (release_clients can block on memory-provider /
         socket teardown while the idle sweeper waits on this lock). The turn rebuilds a fresh agent, so
@@ -1156,9 +1169,13 @@ class TurnRunner:
         if found.evicted is not None:
             self._release_evicted_agent(found.evicted)
         if agent is None:
+            # Read before the new agent can stamp this turn's activity (restart / eviction / cross-process
+            # invalidation must not reset the idle-compaction clock).
+            idle_reference_ts = self._durable_last_activity_ts()
             agent = self._build_fresh_agent(
                 turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr, skip_context_files,
             )
+            agent._idle_compact_reference_ts = idle_reference_ts
             if cache_lock and cache is not None:
                 with cache_lock:
                     # Record the snapshot's session_id with message_count so the cross-process guard

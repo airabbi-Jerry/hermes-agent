@@ -486,3 +486,20 @@ def test_help_and_empty_list_hint_name_the_resolved_home(tmp_path, monkeypatch, 
     assert "~/.hermes" not in out
 
 
+
+
+@pytest.mark.parametrize("extra, expect_mirrored", [([], True), (["--no-mirror"], False)])
+def test_no_mirror_delivers_without_touching_the_session_transcript(
+    whatsapp_bridge, monkeypatch, capsys, extra, expect_mirrored,
+):
+    """Scripted alerts (``--no-mirror``) still deliver but never append to the chat's session;
+    the default keeps the delivery mirror."""
+    mirrored = []
+    monkeypatch.setattr(
+        "tools.send_message_tool._mirror_sent_message", lambda *args: mirrored.append(args) or True,
+    )
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse([*extra, "--to", _GROUP, "--subject", "[Kanban] alert", "body"]))
+    assert exc.value.code == 0
+    assert [path for path, _ in whatsapp_bridge.calls] == ["send"]
+    assert bool(mirrored) is expect_mirrored

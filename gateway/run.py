@@ -4407,7 +4407,8 @@ class GatewayRunner(
         ("compression", "proactive_prune_tokens"),
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
-        ("compression", "min_tail_user_messages"), ("agent", "disabled_toolsets"),
+        ("compression", "min_tail_user_messages"), ("compression", "idle_compact_after_seconds"),
+        ("agent", "disabled_toolsets"),
         ("memory", "provider"), ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"))
 
@@ -4424,6 +4425,9 @@ class GatewayRunner(
         See #15654, #9051.
         """
         if interrupt_depth == 0:
+            # Idle compaction measures the gap since the PREVIOUS turn's activity; the reset below would
+            # make that gap ~0 on every cached turn, so hand the pre-reset stamp over first.
+            agent._idle_compact_reference_ts = getattr(agent, "_last_activity_ts", None)
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
             agent._last_activity_provenance = ActivityProvenance.UNKNOWN
