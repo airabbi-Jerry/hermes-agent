@@ -96,9 +96,16 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest", paginate=True)
-        runs = [run for page in pages for run in page["check_runs"]]
-        if len({r["id"] for r in runs}) != pages[0]["total_count"]:
+        listed = [run for page in pages for run in page["check_runs"]]
+        if len({r["id"] for r in listed}) != pages[0]["total_count"]:
             raise ValueError("Incomplete check-run pagination")
+        # filter=latest is per check suite: a head re-run in a new suite (e.g. once a red main is
+        # fixed) still lists the older suite's run. Only the newest run of each check decides;
+        # a run not yet started is the newest.
+        newest = {}
+        for run in sorted(listed, key=lambda r: (r.get("started_at") or "~", r["id"])):
+            newest[(run["name"], run["app"]["id"])] = run
+        runs = list(newest.values())
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True) for s in page]
         outcomes = []
 

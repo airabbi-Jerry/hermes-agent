@@ -36,13 +36,16 @@ def github(tmp_path, monkeypatch):
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": state.get("name", "required"), "head_sha": sha,
                        "app": {"id": state.get("app", 1)}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
-                       "html_url": "https://github.com/acme/repo/actions/runs/42"}
+                       "started_at": "2026-09-30T23:37:10Z", "html_url": "https://github.com/acme/repo/actions/runs/42"}
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
                 runs = [] if state.get("missing") else [run]
                 if state.get("sibling"):
                     runs.append({**run, "id": 43, "name": "deterministic-gates", "conclusion": state["sibling"],
                                  "status": "in_progress" if state["sibling"] == "pending" else "completed"})
+                # Earlier suites at the same head: filter=latest still lists each suite's runs.
+                runs += [{**r, "id": r["id"] - 40 + 10 * i, "started_at": started, "conclusion": conclusion}
+                         for i, (started, conclusion) in enumerate(state.get("earlier_suites", ())) for r in list(runs)]
                 value = [{"total_count": 100 + len(runs), "check_runs": [
                     {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
                     for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
@@ -173,3 +176,21 @@ def test_plan_gated_rules_require_the_actions_gate_while_other_refusals_stay_inf
         github.update({**gated, "conclusion": "success", **fault})
         receipt = collect_acceptance(url, url)
         assert (receipt["ok"], receipt["classification"]) == (False, expected), fault
+
+
+def test_only_the_newest_run_of_each_check_decides_across_suites(github):
+    """Regression: accounting-firm-automation #131 ran its checks in three suites at one head
+    (green, red against a broken main, green again); the middle suite's failure blocked completion."""
+    refusal = {"message": "Upgrade to GitHub Pro or make this repository public to enable this feature.", "status": "403"}
+    url = "https://github.com/acme/repo/pull/7"
+    github.update({"unprotected": True, "rules_error": (403, [refusal]), "name": "All required checks pass",
+                   "app": 15368, "sibling": "success", "conclusion": "success",
+                   "earlier_suites": [("2026-09-30T22:17:12Z", "success"), ("2026-09-30T23:09:01Z", "failure")]})
+    receipt = collect_acceptance(url, url)
+    assert (receipt["ok"], receipt["classification"]) == (True, "success")
+    assert sorted(c["id"] for c in receipt["checks"]) == [42, 43]
+    # The newest suite is the red one: older greens cannot outvote it.
+    github.update(conclusion="failure", sibling="failure",
+                  earlier_suites=[("2026-09-30T22:17:12Z", "success"), ("2026-09-30T23:09:01Z", "success")])
+    receipt = collect_acceptance(url, url)
+    assert (receipt["ok"], receipt["classification"]) == (False, "failure")
