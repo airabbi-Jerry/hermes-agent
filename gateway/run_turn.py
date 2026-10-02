@@ -93,6 +93,14 @@ def _bg_prompt_preview(prompt: str, limit: int = 60) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _is_live_platform_message(event: Any) -> bool:
+    """A message the platform delivered from its sender: not self-injected and carrying its own
+    platform message id. Goal/retry prompts and other gateway-written turns have none, even when
+    their source still holds the id of the command that started them."""
+    return (event is not None and display_kind_for_event(event) is None
+            and bool(getattr(event, "message_id", None)))
+
+
 def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> bool:
     """One verdict for "this failed turn is a context overflow", shared by transcript persistence
     (#1630 skip) and the user-facing reply so the two can never disagree.
@@ -2065,7 +2073,7 @@ class GatewayTurnMixin:
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
         from gateway.session_context import declare_self_injected
-        declare_self_injected(persist_user_display_kind is not None)
+        declare_self_injected(not _is_live_platform_message(event))
         _redact_pii = False  # privacy.redact_pii, re-read per message
         with suppress(Exception):
             _redact_pii = bool((_load_gateway_config().get("privacy") or {}).get("redact_pii", False))
@@ -3888,6 +3896,12 @@ class GatewayTurnMixin:
         # different profile's adapter, and only that instance holds the per-message reaction state.
         from gateway.run_turn_followup_ack import _followup_cancel_outcome, _run_followup_processing_hook
         _hook_adapter = self._intake_adapter_for(next_source) if pending_event is not None else None
+        # The follow-up runs on the outer turn's session vars, so it declares its own origin; it counts
+        # as the bound sender's live message only if it is one AND comes from that same sender.
+        from gateway.session_context import declare_self_injected
+        declare_self_injected(not (
+            _is_live_platform_message(pending_event)
+            and str(getattr(next_source, "user_id", "") or "") == str(getattr(source, "user_id", "") or "")))
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).

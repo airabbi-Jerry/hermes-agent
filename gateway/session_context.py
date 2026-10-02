@@ -31,16 +31,12 @@ def session_context_engaged() -> bool:
 #   durable key is not consumed by the wrong poller.
 # * MESSAGE_ID: reply anchor keeping notifications inside the originating Telegram topic.
 # * CRON_SESSION: tri-state — _UNSET = legacy env fallback; "1" = cron; "" = non-cron, masks env.
-# * SELF_INJECTED: "1" = the gateway injected this turn itself (internal notice, wake, heartbeat),
-#   "0" = a real inbound message; "" = not declared. Tools acting on the sender's live intent
-#   require "0" — the injected turn reuses the sender's identity vars.
 _SESSION_VARS = (
     _SESSION_PLATFORM, _SESSION_SOURCE, _SESSION_CHAT_ID, _SESSION_CHAT_TYPE,
     _SESSION_CHAT_NAME, _SESSION_THREAD_ID, _SESSION_USER_ID, _SESSION_USER_ID_ALT,
     _SESSION_USER_NAME, _SESSION_SCOPE_ID, _SESSION_KEY, _SESSION_ID,
     _SESSION_UI_SESSION_ID, _SESSION_MESSAGE_ID, _SESSION_PROFILE,
     _BROWSER_CONTROL_PRINCIPAL, _BROWSER_CONTROL_TRANSPORT_FAMILY, _CRON_SESSION, _SESSION_PARENT_CHAT_ID,
-    _SESSION_SELF_INJECTED,
 ) = tuple(ContextVar(name, default=_UNSET) for name in (
     "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
     "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID",
@@ -48,7 +44,7 @@ _SESSION_VARS = (
     "HERMES_SESSION_SCOPE_ID", "HERMES_SESSION_KEY", "HERMES_SESSION_ID",
     "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_SESSION_PROFILE",
     "HERMES_BROWSER_CONTROL_PRINCIPAL", "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
-    "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID", "HERMES_SESSION_SELF_INJECTED",
+    "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID",
 ))
 
 # Whether this channel can route an ASYNC completion back AFTER the turn ends (see
@@ -59,6 +55,13 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # Request-local proof that the client resumes SessionDB history. No env fallback
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
+
+# Whether the gateway wrote this turn itself ("1": internal notice, wake, heartbeat, goal/retry
+# prompt, or a queued follow-up that is not the bound sender's own message) or it is a real platform
+# message from the bound sender ("0"). Injected turns reuse the sender's identity vars, so a tool
+# that may act only on the sender's live instruction requires "0". Request-local like the var
+# above: no env fallback, no child-process export; undeclared reads as "".
+_SESSION_SELF_INJECTED = ContextVar("HERMES_SESSION_SELF_INJECTED", default=_UNSET)
 
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -140,19 +143,25 @@ def set_session_vars(
         platform, source, chat_id, chat_type, chat_name, thread_id, user_id, user_id_alt,
         user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
         browser_control_principal, browser_control_transport_family, cron_session, parent_chat_id,
-        "",  # self-injected: undeclared until the turn path calls declare_self_injected
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    tokens.append(_SESSION_SELF_INJECTED.set(_UNSET))  # only the turn path can declare it
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
 
 def declare_self_injected(self_injected: bool) -> None:
-    """Declare whether the turn just bound by ``set_session_vars`` was injected by the gateway
-    itself; only the turn path knows (it holds the MessageEvent)."""
+    """Declare whether the turn now running was written by the gateway itself (see
+    ``_SESSION_SELF_INJECTED``); only the turn path knows (it holds the MessageEvent)."""
     _SESSION_SELF_INJECTED.set("1" if self_injected else "0")
+
+
+def session_self_injected() -> str:
+    """The current turn's declaration: "1", "0", or "" when nothing declared it."""
+    value = _SESSION_SELF_INJECTED.get()
+    return "" if value is _UNSET else value
 
 
 def clear_session_vars(tokens: list) -> None:
@@ -165,6 +174,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _SESSION_SELF_INJECTED.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -178,6 +188,7 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _SESSION_SELF_INJECTED.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
 
 
