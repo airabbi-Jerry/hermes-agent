@@ -3896,12 +3896,13 @@ class GatewayTurnMixin:
         # different profile's adapter, and only that instance holds the per-message reaction state.
         from gateway.run_turn_followup_ack import _followup_cancel_outcome, _run_followup_processing_hook
         _hook_adapter = self._intake_adapter_for(next_source) if pending_event is not None else None
-        # The follow-up runs on the outer turn's session vars, so it declares its own origin; it counts
-        # as the bound sender's live message only if it is one AND comes from that same sender.
-        from gateway.session_context import declare_self_injected
+        # The follow-up runs on the outer turn's session vars (never rebound down the chain), so it
+        # declares its own origin; it counts as live only if it is a platform message from the sender
+        # those vars are bound to.
+        from gateway.session_context import declare_self_injected, get_session_env
         declare_self_injected(not (
             _is_live_platform_message(pending_event)
-            and str(getattr(next_source, "user_id", "") or "") == str(getattr(source, "user_id", "") or "")))
+            and str(getattr(next_source, "user_id", "") or "") == get_session_env("HERMES_SESSION_USER_ID")))
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).

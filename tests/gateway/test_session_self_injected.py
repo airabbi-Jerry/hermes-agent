@@ -49,13 +49,14 @@ async def test_turn_declares_whether_the_gateway_wrote_it(monkeypatch, tmp_path,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pending, expected", [
-    (_msg(message_id="4712"), "0"),                 # the sender's next message, queued while busy
-    (_msg(internal=True), "1"),                     # a notice queued behind the live turn
-    (_msg(message_id="4712", user_id="999"), "1"),  # someone else in a shared session
+@pytest.mark.parametrize("pending, previous_sender, expected", [
+    (_msg(message_id="4712"), "12345", "0"),                 # the sender's next message, queued while busy
+    (_msg(internal=True), "12345", "1"),                     # a notice queued behind the live turn
+    (_msg(message_id="4712", user_id="999"), "12345", "1"),  # someone else in a shared session
+    (_msg(message_id="4713", user_id="999"), "999", "1"),    # ...and their next one, chained behind it
 ])
-async def test_queued_followup_declares_its_own_origin(monkeypatch, tmp_path, pending, expected):
-    """The follow-up runs in-band on the outer turn's bound vars; it must not inherit its "0"."""
+async def test_queued_followup_declares_its_own_origin(monkeypatch, tmp_path, pending, previous_sender, expected):
+    """Follow-ups run in-band on the first turn's bound vars (bound to 12345); they must not inherit its "0"."""
     runner = _bootstrap(monkeypatch, tmp_path)
     seen = {}
 
@@ -75,8 +76,8 @@ async def test_queued_followup_declares_its_own_origin(monkeypatch, tmp_path, pe
     runner._session_key_for_source = lambda _source: SESSION_KEY
     runner._is_goal_continuation_event = lambda _event: False
     runner._delivery_adapter_for = runner._intake_adapter_for = lambda _source: None
-    outer = _msg()
-    turn_ctx = SimpleNamespace(source=outer.source, session_id="sess", session_key=SESSION_KEY, run_generation=1,
+    previous = _msg(user_id=previous_sender)  # the turn this follow-up is chained behind
+    turn_ctx = SimpleNamespace(source=previous.source, session_id="sess", session_key=SESSION_KEY, run_generation=1,
                                _interrupt_depth=0, history=[], _status_thread_metadata=None, result_holder=[None],
                                context_prompt="")
     tokens = set_session_vars(platform="telegram", user_id="12345", message_id="4711")
