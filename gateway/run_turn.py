@@ -2059,11 +2059,13 @@ class GatewayTurnMixin:
         from gateway.run import _load_gateway_config
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         context = build_session_context(source, self.config, session_entry)
-        # Session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
         # Self-injected turns (MessageEvent(internal=True)) persist with a DB-only display_kind so
         # UIs render timeline notices, not user bubbles; role/content untouched.
         persist_user_display_kind = display_kind_for_event(event)
+        # Session context variables for tools (task-local, concurrency-safe)
+        _session_env_tokens = self._set_session_env(context)
+        from gateway.session_context import declare_self_injected
+        declare_self_injected(persist_user_display_kind is not None)
         _redact_pii = False  # privacy.redact_pii, re-read per message
         with suppress(Exception):
             _redact_pii = bool((_load_gateway_config().get("privacy") or {}).get("redact_pii", False))
