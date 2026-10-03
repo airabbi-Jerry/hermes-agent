@@ -1534,19 +1534,28 @@ def _git_push_argument_lists(command: str):
         if source in seen:
             continue
         seen.add(source)
-        for start, _, word in _iter_shell_command_word_spans(source):
+        for start, _, _ in _iter_shell_command_word_spans(source):
             tokens = _shell_tokens_with_spans(_shell_command_segment(source, start), 0)
             if not tokens:
                 continue
             args = [token[0] for token in tokens]
             for index, token in enumerate(args):
-                if os.path.basename(token).lower() == "git":
+                name = os.path.basename(token).lower()
+                if name == "git":
                     yield args[index:]
-            name = os.path.basename(_deobfuscate_shell_word_for_detection(word)).lower()
-            # These carriers execute a command string, not literal argv. In
-            # particular, eval joins ALL arguments before the shell parses it.
-            if name in {"eval", "ssh", "watch", "su"} and len(args) > 1:
-                pending.append(" ".join(args[1:]))
+                    continue
+                # Carriers may themselves be passed to xargs/other launchers.
+                # eval joins ALL arguments before the shell parses its string.
+                if name in {"eval", "ssh", "watch", "su"} and index + 1 < len(args):
+                    pending.append(" ".join(args[index + 1:]))
+                elif name in _SHELL_NAMES:
+                    _, payload = _bash_exec_payload(args[index + 1:])
+                    if payload:
+                        pending.append(payload)
+                elif name == "env":
+                    payload = _env_split_payload(args[index:])
+                    if payload:
+                        pending.append(payload)
 
 
 def _git_force_push_findings(command: str | None):

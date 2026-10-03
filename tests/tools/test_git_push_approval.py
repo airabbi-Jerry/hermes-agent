@@ -38,6 +38,10 @@ from tools.approval_detection import _approval_key_aliases, detect_dangerous_com
     "git push --exec=+x origin main",
     "git push origin main && printf '%s' '+x'",
     "git push origin main # +x",
+    'eval "printf \'%s\' \'git push --force\'"',
+    "xargs printf '%s' 'git push -f'",
+    "git push --push-option='git push -f' origin main",
+    "git push --push-option='git push origin +x' origin main",
 ])
 def test_branch_names_and_quoted_prose_do_not_request_force_approval(command):
     assert detect_dangerous_command(command) == (False, None, None)
@@ -111,6 +115,11 @@ _PUSH_WRAPPERS = [
     "watch '{command}'",
     "su user -c '{command}'",
     "eval 'xargs {command}'",
+    "xargs bash -c '{command}'",
+    "parallel sh -c '{command}'",
+    "xargs eval '{command}'",
+    "env -S '{command}'",
+    "env --split-string='{command}'",
 ]
 
 
