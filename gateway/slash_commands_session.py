@@ -716,8 +716,8 @@ class GatewaySessionCommandsMixin:
         """Handle /save — export the current session and send it as a document."""
         import tempfile
         from hermes_cli.session_export import (
-            SAVE_TRANSCRIPT_FORMATS, SAVE_USAGE, default_save_filename, normalize_save_format,
-            render_session_for_save)
+            SAVE_TRANSCRIPT_FORMATS, SAVE_USAGE, default_save_filename, drop_undone_rows, export_projection,
+            normalize_save_format, render_session_for_save)
 
         parts = event.get_command_args().split()
         redact = bool(parts) and parts[-1].lower() in ("redact", "--redact")
@@ -738,9 +738,17 @@ class GatewaySessionCommandsMixin:
         # Never trust path separators from chat input; the filename is only echoed to the platform.
         filename = parts[1] if len(parts) > 1 else default_save_filename(session_id, fmt)
         filename = os.path.basename(filename) or default_save_filename(session_id, fmt)
-        export_data = await self._session_db.export_session(session_id, include_compacted=fmt in SAVE_TRANSCRIPT_FORMATS)
+        if fmt not in SAVE_TRANSCRIPT_FORMATS:
+            from hermes_state import SessionExportTooLargeError
+            try:
+                await self._session_db.assert_export_safe(session_id)  # the JSON backup loads every stored row
+            except SessionExportTooLargeError as e:
+                return str(e)
+        export_data = await self._session_db.export_session(session_id, **export_projection(fmt in SAVE_TRANSCRIPT_FORMATS))
         if not export_data:
             return t("gateway.save.no_messages", session_id=session_id)
+        if fmt not in SAVE_TRANSCRIPT_FORMATS:
+            drop_undone_rows(export_data)
         if redact:
             from hermes_cli.session_export_md import redact_session_data
             export_data = redact_session_data(export_data)
