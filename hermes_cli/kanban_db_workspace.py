@@ -590,6 +590,80 @@ def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) ->
     _set_task_column(conn, task_id, "branch_name", str(branch_name))
 
 
+def _target_workspace(
+    old: sqlite3.Row, kind: str, path: Optional[str], branch_name: Optional[str],
+) -> dict:
+    """New ``workspace_kind/path/branch_name`` columns for a retarget to ``kind``.
+
+    Stricter than ``create_task``: a ``dir`` must exist now, so the edited card passes the launch
+    gate immediately instead of failing at claim time. A scratch path is assigned at claim, so a
+    retarget to scratch clears the old one (it might point at a real tree cleanup would remove).
+    """
+    if kind not in _kb.VALID_WORKSPACE_KINDS:
+        raise ValueError(f"workspace_kind must be one of {sorted(_kb.VALID_WORKSPACE_KINDS)}, got {kind!r}")
+    if branch_name and kind != "worktree":
+        raise ValueError("branch_name is only valid for worktree workspaces")
+    if kind == "scratch":
+        if path:
+            raise ValueError("a scratch workspace takes no path; use dir:<path> for an existing directory")
+        return {"workspace_kind": kind, "workspace_path": None, "branch_name": None}
+    if path and not os.path.isabs(path):
+        raise ValueError(f"workspace path {path!r} must be absolute")
+    if kind == "dir" and not (path and os.path.isdir(path)):
+        raise ValueError(f"dir workspace {path!r} does not exist" if path else "dir workspace requires a path")
+    if kind == "worktree" and not branch_name and old["workspace_kind"] == "worktree":
+        branch_name = old["branch_name"]
+    return {"workspace_kind": kind, "workspace_path": path, "branch_name": branch_name if kind == "worktree" else None}
+
+
+def retarget_task(
+    conn: sqlite3.Connection, task_id: str, *, workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None, branch_name: Optional[str] = None,
+    completion_contract: Optional[str] = None, board: Optional[str] = None,
+) -> dict[str, dict[str, Optional[str]]]:
+    """Repoint a task's workspace and/or completion contract; returns ``{field: {"from", "to"}}``.
+
+    Lets an operator fix a mis-specified card in place instead of recreating it. Refuses a
+    workspace move while a worker holds the task (it would keep writing to the old tree) and any
+    change once the task is done/archived (workspace cleaned up, contract already judged). Raises
+    ``ValueError`` with the reason; changes land in one ``edited`` event with old and new values.
+    """
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+
+    if completion_contract is not None:
+        completion_contract = validate_contract(completion_contract)
+    with _kb.write_txn(conn):
+        old = conn.execute(
+            "SELECT status, claim_lock, workspace_kind, workspace_path, branch_name, completion_contract "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if old is None:
+            raise ValueError(f"unknown task {task_id}")
+        if old["status"] in {"done", "archived"}:
+            raise ValueError(f"task {task_id} is {old['status']}; its workspace and contract are settled")
+        new: dict[str, Optional[str]] = {}
+        if workspace_kind is not None:
+            if old["status"] == "running" or old["claim_lock"]:
+                raise ValueError(f"task {task_id} is held by a worker ({old['status']}); "
+                                 "block or reclaim it before moving its workspace")
+            new.update(_target_workspace(old, workspace_kind, workspace_path, branch_name))
+        if completion_contract is not None:
+            new["completion_contract"] = completion_contract
+        changes = {
+            field: {"from": old[field], "to": value}
+            for field, value in new.items() if old[field] != value
+        }
+        if not changes:
+            return {}
+        conn.execute(
+            f"UPDATE tasks SET {', '.join(f'{field} = ?' for field in changes)} WHERE id = ?",
+            (*(change["to"] for change in changes.values()), task_id),
+        )
+        _kb._append_event(conn, task_id, "edited", {"fields": list(changes), "changes": changes})
+    _kb.notify_task_updated(conn, task_id, list(changes), board=board)
+    return changes
+
+
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402

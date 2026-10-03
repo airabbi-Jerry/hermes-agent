@@ -950,14 +950,40 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    contract = getattr(args, "completion_contract", None)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    try:
+        ws_kind, ws_path = _parse_workspace_flag(getattr(args, "workspace", None))
+        branch_name = _parse_branch_flag(getattr(args, "branch", None))
+    except argparse.ArgumentTypeError as exc:
+        return _err(f"kanban edit: {exc}", 2)
+    if branch_name and ws_kind != "worktree":
+        return _err("kanban edit: --branch is only valid with --workspace worktree", 2)
+    retarget = ws_kind is not None or contract is not None
+    if result is not None and retarget:
+        return _err("kanban edit: --result applies to done tasks, whose workspace and contract "
+                    "can no longer change", 2)
+    if all(value is None for value in (title, body, priority, result)) and not retarget:
+        return _err("kanban edit: provide --title, --body, --priority, --workspace, "
+                    "--completion-contract, or --result", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
     with kbc.connect_closing() as conn:
+        if retarget:
+            try:
+                changes = kbw.retarget_task(
+                    conn, args.task_id, workspace_kind=ws_kind, workspace_path=ws_path,
+                    branch_name=branch_name, completion_contract=contract,
+                )
+            except ValueError as exc:
+                return _err(f"kanban edit: {exc}", 1)
+            for field, change in changes.items():
+                print(f"  {field}: {change['from'] or '-'} -> {change['to'] or '-'}")
+            if all(value is None for value in (title, body, priority)):
+                print(f"Edited {args.task_id}" if changes else f"{args.task_id}: nothing to change")
+                return 0
         ok = kb.edit_task(
             conn, args.task_id, title=title, body=body, priority=priority,
             result=result, summary=summary, metadata=metadata,
