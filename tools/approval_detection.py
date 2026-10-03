@@ -1524,16 +1524,37 @@ def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
 _GIT_GLOBAL_OPTIONS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
 
 
+def _git_push_argument_lists(command: str):
+    # The old positionless rules also gated git passed to xargs, find -exec,
+    # and arbitrary launchers. Keep that coverage without matching '-f' inside
+    # branch names or promoting a quoted prose argument into a command.
+    pending, seen = [command], set()
+    while pending:
+        source = pending.pop()
+        if source in seen:
+            continue
+        seen.add(source)
+        for start, _, word in _iter_shell_command_word_spans(source):
+            tokens = _shell_tokens_with_spans(_shell_command_segment(source, start), 0)
+            if not tokens:
+                continue
+            args = [token[0] for token in tokens]
+            for index, token in enumerate(args):
+                if os.path.basename(token).lower() == "git":
+                    yield args[index:]
+            name = os.path.basename(_deobfuscate_shell_word_for_detection(word)).lower()
+            # These carriers execute a command string, not literal argv. In
+            # particular, eval joins ALL arguments before the shell parses it.
+            if name in {"eval", "ssh", "watch", "su"} and len(args) > 1:
+                pending.append(" ".join(args[1:]))
+
+
 def _git_force_push_findings(command: str | None):
     # Branches such as feat/aios-f-vat-placeholder contain '-f' but do not
-    # rewrite history. Parse actual argument tokens in executable positions.
+    # rewrite history. Parse actual argument tokens, including wrapped commands.
     if not command or "git" not in command.lower():
         return
-    for start, _, word in _iter_shell_command_word_spans(command):
-        if os.path.basename(_deobfuscate_shell_word_for_detection(word)).lower() != "git":
-            continue
-        tokens = _shell_tokens_with_spans(_shell_command_segment(command, start), 0)
-        args = [token[0] for token in tokens] if tokens else []
+    for args in _git_push_argument_lists(command):
         index = 1
         while index < len(args) and args[index].startswith("-"):
             token = args[index]

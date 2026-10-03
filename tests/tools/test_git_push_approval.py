@@ -93,3 +93,57 @@ def test_real_force_flags_remain_behind_the_approval_gate(command):
     assert key and description
     if description.startswith("git force push"):
         assert r"git\s+push" in _approval_key_aliases(key)
+
+
+_PUSH_WRAPPERS = [
+    "eval {command}",
+    'eval "{command}"',
+    "eval '{command}'",
+    "sudo eval '{command}'",
+    "xargs {command}",
+    "xargs -n 1 -- {command}",
+    "printf '%s' main | xargs {command}",
+    "parallel -- {command}",
+    r"find . -exec {command} \;",
+    "custom-launcher {command}",
+    "ssh host {command}",
+    "ssh host '{command}'",
+    "watch '{command}'",
+    "su user -c '{command}'",
+    "eval 'xargs {command}'",
+]
+
+
+@pytest.mark.parametrize("wrapper", _PUSH_WRAPPERS)
+@pytest.mark.parametrize("push", [
+    "git push -f origin main",
+    "git push --force origin main",
+    "git push --force-with-lease origin main",
+    "git push -uf origin main",
+    "git push -fu origin main",
+    "git -C repo push --force origin main",
+    "git -C repo push -f origin main",
+    "git -C repo push --force-with-lease origin main",
+    "git -C repo push -uf origin main",
+    "git -C repo push -fu origin main",
+    "git push origin +x",
+    "git -C repo push origin +refs/heads/x:refs/heads/x",
+])
+def test_wrappers_preserve_force_push_approval(wrapper, push):
+    dangerous, key, description = detect_dangerous_command(wrapper.format(command=push))
+    assert dangerous
+    assert description.startswith("git force push")
+    assert r"git\s+push" in _approval_key_aliases(key)
+
+
+@pytest.mark.parametrize("wrapper", _PUSH_WRAPPERS)
+@pytest.mark.parametrize("push", [
+    "git push -u origin feat/aios-f-vat-placeholder",
+    "git -C repo push -u origin feat/aios-f-test",
+    "git push origin feat/fix--force-placeholder",
+    "git push --push-option=-f origin main",
+    "git push --push-option=+x origin main",
+    "git push --repo=+remote main",
+])
+def test_wrapped_safe_pushes_do_not_request_force_approval(wrapper, push):
+    assert detect_dangerous_command(wrapper.format(command=push)) == (False, None, None)
